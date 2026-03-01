@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -34,13 +34,14 @@ from ..ml.splitter import (
     recluster,
 )
 from ..organizer import find_image_folders
+from .base_worker import BaseWorker
 from .split_dialog import SplitDialog
 from .widgets import StatusProgressBar
 
 
 # ── BatchScanWorker ────────────────────────────────────────────
 
-class BatchScanWorker(QThread):
+class BatchScanWorker(BaseWorker):
     """后台批量扫描：逐文件夹提取特征+聚类。"""
 
     status = Signal(str)
@@ -48,31 +49,23 @@ class BatchScanWorker(QThread):
     image_progress = Signal(int, int)        # (current, total)
     folder_done = Signal(int, int, object)   # (idx, total, BatchScanItem)
     finished_ok = Signal(list)               # list[BatchScanItem]
-    finished_err = Signal(str)
 
     def __init__(self, folders: list[Path], threshold: float):
         super().__init__()
         self._folders = folders
         self._threshold = threshold
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            results = batch_extract_and_split(
-                self._folders,
-                self._threshold,
-                is_cancelled=lambda: self._cancelled,
-                on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
-                on_status=lambda msg: self.status.emit(msg),
-                on_image_progress=lambda c, t: self.image_progress.emit(c, t),
-                on_folder_done=lambda i, t, item: self.folder_done.emit(i, t, item),
-            )
-            self.finished_ok.emit(results)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        results = batch_extract_and_split(
+            self._folders,
+            self._threshold,
+            is_cancelled=lambda: self._cancelled,
+            on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
+            on_status=lambda msg: self.status.emit(msg),
+            on_image_progress=lambda c, t: self.image_progress.emit(c, t),
+            on_folder_done=lambda i, t, item: self.folder_done.emit(i, t, item),
+        )
+        self.finished_ok.emit(results)
 
 
 # ── 筛选枚举 ───────────────────────────────────────────────────

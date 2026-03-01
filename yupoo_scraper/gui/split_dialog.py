@@ -65,7 +65,7 @@ MIME_IMAGE_PATH = "application/x-product-split-image"
 class FlowLayout(QLayout):
     """自动换行的流式布局（Qt 不内置此布局）。"""
 
-    def __init__(self, parent: QWidget | None = None, spacing: int = 4):
+    def __init__(self, parent: QWidget | None = None, spacing: int = 4) -> None:
         super().__init__(parent)
         self._items: list[QLayoutItem] = []
         self._spacing = spacing
@@ -143,7 +143,7 @@ class ThumbnailWidget(QLabel):
     _STYLE_NORMAL = "border: 1px solid #ccc; background: white; padding: 2px;"
     _STYLE_SELECTED = "border: 3px solid #3daee9; background: #d4edfc; padding: 0px;"
 
-    def __init__(self, image_path: Path, thumb_size: int = THUMBNAIL_SIZE):
+    def __init__(self, image_path: Path, thumb_size: int = THUMBNAIL_SIZE) -> None:
         super().__init__()
         self.image_path = image_path
         self._thumb_size = thumb_size
@@ -245,7 +245,7 @@ class GroupWidget(QGroupBox):
     image_dropped = Signal(str, int)  # (image_path_str, target_group_id)
     thumbnail_added = Signal(object)  # (ThumbnailWidget,)
 
-    def __init__(self, group: SplitGroup, parent: QWidget | None = None):
+    def __init__(self, group: SplitGroup, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.group_id = group.id
         self.setAcceptDrops(True)
@@ -331,11 +331,11 @@ class GroupWidget(QGroupBox):
         self._count_label.setText(f"({len(self._thumbnails)} 张)")
         return True
 
-    def dragEnterEvent(self, event):
+    def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasFormat(MIME_IMAGE_PATH):
             event.acceptProposedAction()
 
-    def dropEvent(self, event):
+    def dropEvent(self, event) -> None:
         data = event.mimeData().data(MIME_IMAGE_PATH)
         payload = bytes(data).decode("utf-8")
         # 支持多路径（换行分隔）
@@ -348,65 +348,52 @@ class GroupWidget(QGroupBox):
 
 # ── 工作线程 ───────────────────────────────────────────────────
 
-from PySide6.QtCore import QThread
+from .base_worker import BaseWorker
 
 
-class SplitWorker(QThread):
+class SplitWorker(BaseWorker):
     """后台执行特征提取+聚类。"""
 
     status = Signal(str)
     progress = Signal(int, int)  # (current, total)
     finished_ok = Signal(object)  # SplitResult
-    finished_err = Signal(str)
 
-    def __init__(self, folder: Path, threshold: float):
+    def __init__(self, folder: Path, threshold: float) -> None:
         super().__init__()
         self._folder = folder
         self._threshold = threshold
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self):
-        try:
-            result = extract_and_split(
-                self._folder,
-                threshold=self._threshold,
-                on_status=lambda msg: (
-                    self.status.emit(msg) if not self._cancelled else None
-                ),
-                on_progress=lambda cur, tot: (
-                    self.progress.emit(cur, tot) if not self._cancelled else None
-                ),
-            )
-            if not self._cancelled:
-                self.finished_ok.emit(result)
-        except Exception as e:
-            if not self._cancelled:
-                self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        result = extract_and_split(
+            self._folder,
+            threshold=self._threshold,
+            on_status=lambda msg: (
+                self.status.emit(msg) if not self._cancelled else None
+            ),
+            on_progress=lambda cur, tot: (
+                self.progress.emit(cur, tot) if not self._cancelled else None
+            ),
+        )
+        if not self._cancelled:
+            self.finished_ok.emit(result)
 
 
-class ApplyWorker(QThread):
+class ApplyWorker(BaseWorker):
     """后台执行文件移动。"""
 
     progress = Signal(int, int)
     finished_ok = Signal(list)  # list[Path]
-    finished_err = Signal(str)
 
-    def __init__(self, result: SplitResult):
+    def __init__(self, result: SplitResult) -> None:
         super().__init__()
         self._result = result
 
-    def run(self):
-        try:
-            folders = apply_split(
-                self._result,
-                on_progress=lambda cur, tot: self.progress.emit(cur, tot),
-            )
-            self.finished_ok.emit(folders)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        folders = apply_split(
+            self._result,
+            on_progress=lambda cur, tot: self.progress.emit(cur, tot),
+        )
+        self.finished_ok.emit(folders)
 
 
 # ── SplitDialog ────────────────────────────────────────────────

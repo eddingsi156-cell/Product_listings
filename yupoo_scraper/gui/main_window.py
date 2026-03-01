@@ -21,7 +21,7 @@ from .uploader_tab import UploaderTab
 class MainWindow(QMainWindow):
     """应用主窗口"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
         self.setWindowTitle("产品上架工具")
@@ -68,10 +68,10 @@ class MainWindow(QMainWindow):
         self._uploader_tab.status_message.connect(self._on_status_message)
 
     @Slot(str)
-    def _on_status_message(self, msg: str):
+    def _on_status_message(self, msg: str) -> None:
         self._status_label.setText(msg)
 
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
         self._scraper_tab.cleanup()
         self._processor_tab.cleanup()
         self._dedup_tab.cleanup()

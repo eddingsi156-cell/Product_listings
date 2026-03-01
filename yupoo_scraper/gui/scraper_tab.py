@@ -52,7 +52,7 @@ class ScraperTab(QWidget):
     # 信号
     status_message = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._albums: list[Album] = []
         self._album_details: list[AlbumDetail] = []
@@ -66,7 +66,7 @@ class ScraperTab(QWidget):
 
     # ── UI 构建 ────────────────────────────────────────────────
 
-    def _init_ui(self):
+    def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         # -- URL 输入区域 --
@@ -174,7 +174,7 @@ class ScraperTab(QWidget):
 
     # ── URL 历史 ─────────────────────────────────────────────────
 
-    def _load_url_history(self):
+    def _load_url_history(self) -> None:
         """从 JSON 文件加载 URL 历史记录到下拉框。"""
         try:
             if config.URL_HISTORY_FILE.exists():
@@ -185,7 +185,7 @@ class ScraperTab(QWidget):
         except Exception:
             pass  # 文件损坏不影响使用
 
-    def _save_url_history(self, url: str):
+    def _save_url_history(self, url: str) -> None:
         """保存 URL 到历史记录（最近使用的在最前面）。"""
         # 收集现有项
         urls = [self._url_input.itemText(i) for i in range(self._url_input.count())]
@@ -229,7 +229,7 @@ class ScraperTab(QWidget):
             pass
         return {}
 
-    def _save_download_log(self):
+    def _save_download_log(self) -> None:
         """持久化下载日志到 JSON 文件。"""
         try:
             config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -246,7 +246,7 @@ class ScraperTab(QWidget):
 
     # ── 辅助 ───────────────────────────────────────────────────
 
-    def _log(self, msg: str):
+    def _log(self, msg: str) -> None:
         self._log_text.append(msg)
         self.status_message.emit(msg)
 
@@ -260,14 +260,14 @@ class ScraperTab(QWidget):
                     selected.append(self._albums[row])
         return selected
 
-    def _update_selection_label(self):
+    def _update_selection_label(self) -> None:
         selected = self._get_selected_albums()
         total_images = sum(a.image_count for a in selected)
         self._selection_label.setText(
             f"已选: {len(selected)} 个相册, {total_images} 张图片"
         )
 
-    def _set_all_checked(self, checked: bool):
+    def _set_all_checked(self, checked: bool) -> None:
         for row in range(self._album_table.rowCount()):
             cb_widget = self._album_table.cellWidget(row, 0)
             if cb_widget:
@@ -276,7 +276,7 @@ class ScraperTab(QWidget):
                     cb.setChecked(checked)
         self._update_selection_label()
 
-    def _set_ui_downloading(self, downloading: bool):
+    def _set_ui_downloading(self, downloading: bool) -> None:
         self._fetch_btn.setEnabled(not downloading)
         self._download_btn.setEnabled(not downloading)
         self._category_combo.setEnabled(not downloading)
@@ -289,13 +289,13 @@ class ScraperTab(QWidget):
     # ── 事件处理 ───────────────────────────────────────────────
 
     @Slot()
-    def _on_browse_dir(self):
+    def _on_browse_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择保存路径", self._dir_input.text())
         if path:
             self._dir_input.setText(path)
 
     @Slot()
-    def _on_fetch_albums(self):
+    def _on_fetch_albums(self) -> None:
         url = self._url_input.currentText().strip()
         if not url:
             QMessageBox.warning(self, "提示", "请输入 Yupoo 相册地址")
@@ -316,7 +316,7 @@ class ScraperTab(QWidget):
             self._fetch_task.cancel()
         self._fetch_task = asyncio.ensure_future(self._fetch_categories_async())
 
-    async def _fetch_categories_async(self):
+    async def _fetch_categories_async(self) -> None:
         """获取分类列表并填充 ComboBox，然后自动加载第一个分类的相册。"""
         try:
             async with aiohttp.ClientSession() as session:
@@ -350,7 +350,7 @@ class ScraperTab(QWidget):
             self._fetch_btn.setEnabled(True)
 
     @Slot(int)
-    def _on_category_changed(self, index: int):
+    def _on_category_changed(self, index: int) -> None:
         """分类切换时重新加载相册列表。"""
         if index < 0:
             return
@@ -363,7 +363,7 @@ class ScraperTab(QWidget):
             self._fetch_task.cancel()
         self._fetch_task = asyncio.ensure_future(self._fetch_albums_async(category_id))
 
-    async def _fetch_albums_async(self, category_id: str | None = None):
+    async def _fetch_albums_async(self, category_id: str | None = None) -> None:
         """获取相册列表。category_id 为 None 时加载所有相册。"""
         if category_id is None:
             category_id = self._category_combo.currentData()
@@ -403,7 +403,7 @@ class ScraperTab(QWidget):
         finally:
             self._fetch_btn.setEnabled(True)
 
-    def _populate_album_table(self):
+    def _populate_album_table(self) -> None:
         self._album_table.setRowCount(len(self._albums))
         for row, album in enumerate(self._albums):
             # 查询下载日志
@@ -459,7 +459,7 @@ class ScraperTab(QWidget):
 
     # ── 相册去重 ─────────────────────────────────────────────────
 
-    def _mark_row_duplicate(self, row: int, reason: str):
+    def _mark_row_duplicate(self, row: int, reason: str) -> None:
         """将指定行标记为重复：取消勾选、背景变黄、写入状态。"""
         # 取消勾选
         cb_widget = self._album_table.cellWidget(row, 0)
@@ -480,7 +480,7 @@ class ScraperTab(QWidget):
         if status_item:
             status_item.setText(reason)
 
-    async def _detect_duplicates(self):
+    async def _detect_duplicates(self) -> None:
         """检测相册列表中的重复项（标题相同 + 封面 pHash）。
 
         先做标题精确匹配（零成本），再异步下载封面图做 pHash 对比。
@@ -593,7 +593,7 @@ class ScraperTab(QWidget):
     # ── 下载流程 ───────────────────────────────────────────────
 
     @Slot()
-    def _on_start_download(self):
+    def _on_start_download(self) -> None:
         selected = self._get_selected_albums()
         if not selected:
             QMessageBox.warning(self, "提示", "请至少选择一个相册")
@@ -613,7 +613,7 @@ class ScraperTab(QWidget):
             self._download_flow(selected, download_dir)
         )
 
-    async def _download_flow(self, albums: list[Album], download_dir: Path):
+    async def _download_flow(self, albums: list[Album], download_dir: Path) -> None:
         """生产者-消费者模式：边扫描相册边下载图片。
 
         生产者: 逐个获取相册的图片 URL，放入队列
@@ -761,7 +761,7 @@ class ScraperTab(QWidget):
             self._set_ui_downloading(False)
 
     @Slot()
-    def _on_pause(self):
+    def _on_pause(self) -> None:
         if self._downloader is None:
             return
         if not self._is_paused:
@@ -778,7 +778,7 @@ class ScraperTab(QWidget):
             self._log("下载已恢复")
 
     @Slot()
-    def _on_stop(self):
+    def _on_stop(self) -> None:
         if self._downloader:
             self._downloader.cancel()
             self._log("正在停止 ...")

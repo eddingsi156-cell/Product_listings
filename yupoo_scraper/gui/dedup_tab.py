@@ -9,7 +9,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -60,48 +60,45 @@ _COLOR_REVIEW = QColor(255, 240, 200)      # 黄
 _COLOR_NEW = QColor(200, 255, 200)         # 绿
 _COLOR_ERROR = QColor(220, 220, 220)       # 灰
 
+from .base_worker import BaseWorker
 
 # ── DedupScanWorker ────────────────────────────────────────────
 
-class DedupInitWorker(QThread):
+class DedupInitWorker(BaseWorker):
     """后台初始化 Deduplicator（加载 CLIP 模型 + FAISS 索引）。"""
 
     status = Signal(str)
     finished_ok = Signal(object, list)   # (Deduplicator, folders)
-    finished_err = Signal(str)
 
     def __init__(self, download_dir: Path, image_exts: set[str]):
         super().__init__()
         self._download_dir = download_dir
         self._image_exts = image_exts
 
-    def run(self) -> None:
-        try:
-            self.status.emit("正在初始化查重引擎...")
-            dedup = Deduplicator()
-            dedup.initialize()
+    def _run(self) -> None:
+        self.status.emit("正在初始化查重引擎...")
+        dedup = Deduplicator()
+        dedup.initialize()
 
-            # 扫描新文件夹（I/O 密集，也在后台完成）
-            self.status.emit("正在扫描文件夹...")
-            registered = dedup.get_registered_folders()
-            folders: list[Path] = []
-            if self._download_dir.exists():
-                for sub in sorted(self._download_dir.iterdir()):
-                    if not sub.is_dir():
-                        continue
-                    has_images = any(
-                        f.is_file() and f.suffix.lower() in self._image_exts
-                        for f in sub.iterdir()
-                    )
-                    if has_images and str(sub) not in registered:
-                        folders.append(sub)
+        # 扫描新文件夹（I/O 密集，也在后台完成）
+        self.status.emit("正在扫描文件夹...")
+        registered = dedup.get_registered_folders()
+        folders: list[Path] = []
+        if self._download_dir.exists():
+            for sub in sorted(self._download_dir.iterdir()):
+                if not sub.is_dir():
+                    continue
+                has_images = any(
+                    f.is_file() and f.suffix.lower() in self._image_exts
+                    for f in sub.iterdir()
+                )
+                if has_images and str(sub) not in registered:
+                    folders.append(sub)
 
-            self.finished_ok.emit(dedup, folders)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+        self.finished_ok.emit(dedup, folders)
 
 
-class DedupScanWorker(QThread):
+class DedupScanWorker(BaseWorker):
     """后台批量扫描查重。"""
 
     status = Signal(str)
@@ -109,92 +106,76 @@ class DedupScanWorker(QThread):
     image_progress = Signal(int, int)        # (current, total)
     folder_done = Signal(int, int, object)   # (idx, total, DedupScanItem)
     finished_ok = Signal(list)               # list[DedupScanItem]
-    finished_err = Signal(str)
 
     def __init__(self, deduplicator: Deduplicator, folders: list[Path]):
         super().__init__()
         self._dedup = deduplicator
         self._folders = folders
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            results = self._dedup.batch_scan(
-                self._folders,
-                is_cancelled=lambda: self._cancelled,
-                on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
-                on_status=lambda msg: self.status.emit(msg),
-                on_image_progress=lambda c, t: self.image_progress.emit(c, t),
-                on_folder_done=lambda i, t, item: self.folder_done.emit(i, t, item),
-            )
-            self.finished_ok.emit(results)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        results = self._dedup.batch_scan(
+            self._folders,
+            is_cancelled=lambda: self._cancelled,
+            on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
+            on_status=lambda msg: self.status.emit(msg),
+            on_image_progress=lambda c, t: self.image_progress.emit(c, t),
+            on_folder_done=lambda i, t, item: self.folder_done.emit(i, t, item),
+        )
+        self.finished_ok.emit(results)
 
 
 # ── DedupRegisterWorker ───────────────────────────────────────
 
-class DedupRegisterWorker(QThread):
+class DedupRegisterWorker(BaseWorker):
     """后台批量注册新产品到 DB + FAISS。"""
 
     progress = Signal(int, int)     # (current, total)
     finished_ok = Signal(int)       # 注册成功数量
-    finished_err = Signal(str)
 
     def __init__(self, deduplicator: Deduplicator, items: list[DedupScanItem]):
         super().__init__()
         self._dedup = deduplicator
         self._items = items
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
+    def _run(self) -> None:
+        count = 0
+        errors = 0
+        total = len(self._items)
+        today = date.today().isoformat()
 
-    def run(self) -> None:
-        try:
-            count = 0
-            errors = 0
-            total = len(self._items)
-            today = date.today().isoformat()
+        for i, item in enumerate(self._items):
+            if self._cancelled:
+                break
+            if item.embedding is None:
+                continue
 
-            for i, item in enumerate(self._items):
-                if self._cancelled:
-                    break
-                if item.embedding is None:
-                    continue
-
-                try:
-                    self._dedup.register_product(
-                        name=item.name,
-                        store="",
-                        folder=str(item.folder),
-                        source_url="",
-                        download_date=today,
-                        image_count=item.image_count,
-                        embedding=item.embedding,
-                        save=False,
-                    )
-                    count += 1
-                except Exception as e:
-                    errors += 1
-                    logger.warning("注册产品失败 %s: %s", item.name, e)
-
-                self.progress.emit(i + 1, total)
-
-            # 批量注册结束后统一持久化 FAISS 索引（一次写盘）
-            self._dedup.save_index()
-
-            if errors > 0:
-                self.finished_err.emit(
-                    f"注册完成但有 {errors} 个失败（成功 {count} 个）"
+            try:
+                self._dedup.register_product(
+                    name=item.name,
+                    store="",
+                    folder=str(item.folder),
+                    source_url="",
+                    download_date=today,
+                    image_count=item.image_count,
+                    embedding=item.embedding,
+                    save=False,
                 )
-            else:
-                self.finished_ok.emit(count)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+                count += 1
+            except Exception as e:
+                errors += 1
+                logger.warning("注册产品失败 %s: %s", item.name, e)
+
+            self.progress.emit(i + 1, total)
+
+        # 批量注册结束后统一持久化 FAISS 索引（一次写盘）
+        self._dedup.save_index()
+
+        if errors > 0:
+            self.finished_err.emit(
+                f"注册完成但有 {errors} 个失败（成功 {count} 个）"
+            )
+        else:
+            self.finished_ok.emit(count)
 
 
 # ── ProductImageDialog ────────────────────────────────────────

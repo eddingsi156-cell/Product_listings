@@ -39,7 +39,7 @@ class BatchResult:
     failed: int = 0
     errors: list[str] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.errors is None:
             self.errors = []
 
@@ -137,21 +137,21 @@ class Downloader:
     def is_cancelled(self) -> bool:
         return self._cancel_event.is_set()
 
-    def cancel(self):
+    def cancel(self) -> None:
         """取消下载（立即取消所有活跃任务）"""
         self._cancel_event.set()
         for task in self._active_tasks:
             task.cancel()
 
-    def pause(self):
+    def pause(self) -> None:
         """暂停下载"""
         self._pause_event.clear()
 
-    def resume(self):
+    def resume(self) -> None:
         """恢复下载"""
         self._pause_event.set()
 
-    def reset(self):
+    def reset(self) -> None:
         """重置状态以用于新一轮下载（在当前事件循环中重建 Semaphore）。"""
         self._semaphore = asyncio.Semaphore(self.max_concurrency)
         self._cancel_event.clear()
@@ -241,7 +241,7 @@ class Downloader:
 
         return DownloadResult(url=url, path=save_path, success=False, error=last_error)
 
-    async def _warm_cdn_cookies(self, session: aiohttp.ClientSession, urls: list[str]):
+    async def _warm_cdn_cookies(self, session: aiohttp.ClientSession, urls: list[str]) -> None:
         """预先解决 CDN 挑战，避免并发下载时多次遇到挑战。"""
         # 收集需要预热的 CDN 域名
         domains_to_warm: set[str] = set()

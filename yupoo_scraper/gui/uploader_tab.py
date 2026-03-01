@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -36,17 +36,17 @@ from .widgets import StatusProgressBar
 
 from ..config import IMAGE_EXTS
 from ..organizer import find_image_folders
+from .base_worker import BaseWorker
 
 
 # ── Workers ──────────────────────────────────────────────────────
 
-class PreviewWorker(QThread):
+class PreviewWorker(BaseWorker):
     """后台生成标题预览（CLIP zero-shot 分类）。"""
 
     status = Signal(str)
     progress = Signal(int, int)           # (current, total)
     finished_ok = Signal(list)            # list[ProductInfo]
-    finished_err = Signal(str)
 
     def __init__(
         self,
@@ -65,30 +65,27 @@ class PreviewWorker(QThread):
         self._price_min = price_min
         self._price_max = price_max
 
-    def run(self) -> None:
-        try:
-            self.status.emit("正在加载 CLIP 模型...")
-            gen = TitleGenerator()
-            products = gen.batch_generate(
-                self._folders,
-                price=self._price,
-                stock=self._stock,
-                on_progress=lambda c, t: self.progress.emit(c, t),
-            )
+    def _run(self) -> None:
+        self.status.emit("正在加载 CLIP 模型...")
+        gen = TitleGenerator()
+        products = gen.batch_generate(
+            self._folders,
+            price=self._price,
+            stock=self._stock,
+            on_progress=lambda c, t: self.progress.emit(c, t),
+        )
 
-            # 随机价格模式
-            if self._price_mode == "random":
-                for p in products:
-                    p.price = round(
-                        random.uniform(self._price_min, self._price_max), 2,
-                    )
+        # 随机价格模式
+        if self._price_mode == "random":
+            for p in products:
+                p.price = round(
+                    random.uniform(self._price_min, self._price_max), 2,
+                )
 
-            self.finished_ok.emit(products)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+        self.finished_ok.emit(products)
 
 
-class UploadWorker(QThread):
+class UploadWorker(BaseWorker):
     """后台执行批量上架（Playwright 自动化）。"""
 
     status = Signal(str)
@@ -96,17 +93,12 @@ class UploadWorker(QThread):
     step_update = Signal(str)             # 当前步骤描述
     product_done = Signal(int, object)    # (index, UploadResult)
     finished_ok = Signal(list)            # list[UploadResult]
-    finished_err = Signal(str)
 
     def __init__(self, products: list[ProductInfo], cdp_url: str):
         super().__init__()
         self._products = products
         self._cdp_url = cdp_url
-        self._cancelled = False
         self._chrome_proc = None
-
-    def cancel(self) -> None:
-        self._cancelled = True
 
     def cleanup_chrome(self) -> None:
         """清理由本 worker 启动的 Chrome 进程（线程安全）。"""
@@ -120,7 +112,8 @@ class UploadWorker(QThread):
             self._chrome_proc = None
 
     def run(self) -> None:
-        # 直接创建 ProactorEventLoop 而非修改全局策略，避免污染主线程的 qasync
+        # UploadWorker 需要自己的事件循环（Playwright 是 async 的），
+        # 因此覆盖 run() 而非使用基类的模板方法。
         if sys.platform == "win32":
             loop = asyncio.ProactorEventLoop()
         else:

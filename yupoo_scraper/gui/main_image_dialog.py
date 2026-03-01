@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -27,6 +27,7 @@ from ..image_processor import (
     remove_background_to_white,
     reorder_main_image,
 )
+from .base_worker import BaseWorker
 from .split_dialog import FlowLayout
 
 
@@ -38,7 +39,7 @@ class ClickableThumbnailWidget(QLabel):
 
     clicked = Signal(object)  # 发出自身
 
-    def __init__(self, image_path: Path, thumb_size: int = THUMBNAIL_SIZE):
+    def __init__(self, image_path: Path, thumb_size: int = THUMBNAIL_SIZE) -> None:
         super().__init__()
         self.image_path = image_path
         self._thumb_size = thumb_size
@@ -80,22 +81,18 @@ class ClickableThumbnailWidget(QLabel):
 # ── RemoveBgWorker ───────────────────────────────────────────
 
 
-class RemoveBgWorker(QThread):
+class RemoveBgWorker(BaseWorker):
     """后台去除背景。"""
 
     finished_ok = Signal(object)  # PIL Image
-    finished_err = Signal(str)
 
-    def __init__(self, image_path: Path):
+    def __init__(self, image_path: Path) -> None:
         super().__init__()
         self._path = image_path
 
-    def run(self) -> None:
-        try:
-            result = remove_background_to_white(self._path)
-            self.finished_ok.emit(result)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        result = remove_background_to_white(self._path)
+        self.finished_ok.emit(result)
 
 
 # ── CompareDialog ────────────────────────────────────────────

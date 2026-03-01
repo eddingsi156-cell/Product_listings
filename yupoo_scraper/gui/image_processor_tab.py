@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,12 +28,13 @@ from ..image_processor import (
 )
 from ..organizer import find_image_folders
 from .main_image_dialog import MainImageDialog
+from .base_worker import BaseWorker
 from .widgets import StatusProgressBar
 
 
 # ── Worker ────────────────────────────────────────────────────────
 
-class ImageProcessWorker(QThread):
+class ImageProcessWorker(BaseWorker):
     """后台批量图片处理。"""
 
     status = Signal(str)
@@ -41,7 +42,6 @@ class ImageProcessWorker(QThread):
     image_progress = Signal(int, int, str)     # (current, total, image_name)
     folder_done = Signal(int, int, object)     # (idx, total, FolderProcessResult)
     finished_ok = Signal(list)                 # list[FolderProcessResult]
-    finished_err = Signal(str)
 
     def __init__(
         self,
@@ -53,25 +53,18 @@ class ImageProcessWorker(QThread):
         self._folders = folders
         self._fill_color = fill_color
         self._quality = quality
-        self._cancelled = False
 
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            results = batch_process(
-                self._folders,
-                fill_color=self._fill_color,
-                quality=self._quality,
-                is_cancelled=lambda: self._cancelled,
-                on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
-                on_image_done=lambda c, t, p: self.image_progress.emit(c, t, p.name),
-                on_folder_done=lambda i, t, r: self.folder_done.emit(i, t, r),
-            )
-            self.finished_ok.emit(results)
-        except Exception as e:
-            self.finished_err.emit(str(e))
+    def _run(self) -> None:
+        results = batch_process(
+            self._folders,
+            fill_color=self._fill_color,
+            quality=self._quality,
+            is_cancelled=lambda: self._cancelled,
+            on_folder_start=lambda i, t, p: self.folder_started.emit(i, t, p.name),
+            on_image_done=lambda c, t, p: self.image_progress.emit(c, t, p.name),
+            on_folder_done=lambda i, t, r: self.folder_done.emit(i, t, r),
+        )
+        self.finished_ok.emit(results)
 
 
 # ── ImageProcessorTab ─────────────────────────────────────────────
