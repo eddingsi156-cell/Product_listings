@@ -478,18 +478,23 @@ class WeidianUploader:
             ref_box = bg_box if used_bg_screenshot else iframe_box
             gap_x_in_bg = gap_x_css if used_bg_screenshot else (gap_x_css - (bg_box["x"] - iframe_box["x"]))
 
-            # 滑动距离 = 缺口在背景图内的X - 拼图块在背景图内的初始X（左边缘对齐）
+            # 滑动距离计算
+            # 公式：缺口位置 - 拼图块初始位置 - 0.18*拼图块宽度
+            # 经过多次调试确定的最优参数
             if piece_left_css and piece_left_css.get("left") is not None:
                 piece_left = piece_left_css["left"]
-                slide_distance = max(1, int(gap_x_in_bg - piece_left))
+                piece_width = piece_left_css.get("width", 0)
+                
+                slide_distance = max(1, int(gap_x_in_bg - piece_left - piece_width * 0.18))
                 logger.info(
-                    "拼图块 CSS left=%.0f, width=%.0f",
-                    piece_left, piece_left_css.get("width", 0),
+                    "拼图块 left=%.0f, width=%.0f, 滑动距离=%.0f-%.0f-%.1f=%.0f",
+                    piece_left, piece_width,
+                    gap_x_in_bg, piece_left, piece_width * 0.18,
+                    slide_distance
                 )
             else:
-                # 降级：无法获取拼图块位置时，用背景图左边缘作为基准
-                logger.warning("未找到拼图块 left 样式，降级用背景图左边缘")
-                slide_distance = max(1, int(gap_x_in_bg))
+                logger.warning("未找到拼图块信息，降级用 gap_x - 60")
+                slide_distance = max(1, int(gap_x_in_bg - 60))
 
             logger.info(
                 "DPR=%.2f, 截图gap_x=%d, CSS gap_x=%.1f, "

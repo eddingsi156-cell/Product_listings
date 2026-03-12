@@ -71,12 +71,6 @@ def generate_human_track(distance: int) -> list[tuple[int, int, int]]:
     # 到达后短暂停顿（模拟确认）
     track.append((0, 0, random.randint(30, 80)))
 
-    # 过冲 + 回调（概率 40%，更拟人）
-    if random.random() < 0.4:
-        overshoot = random.randint(3, 8)
-        track.append((overshoot, random.randint(-1, 1), random.randint(20, 50)))
-        track.append((-overshoot, random.randint(-1, 1), random.randint(60, 120)))
-
     return track
 
 
