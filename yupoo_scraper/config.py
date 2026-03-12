@@ -191,6 +191,17 @@ UPLOAD_RETRY_DELAY = 5                   # 重试间隔(秒)
 # 代理配置
 WEIDIAN_PROXY_URL = ""                   # 代理地址，如 "http://127.0.0.1:7890"
 
+# ── 验证码打码平台 ────────────────────────────────────────────────
+# 支持平台: "ttshitu" (图鉴) 或 "twocaptcha" (2Captcha)，留空则跳过自动识别
+# 注意: 以下值为运行时默认值，实际由 GUI 设置对话框管理并持久化到 JSON 文件
+CAPTCHA_SETTINGS_FILE = DATA_DIR / "captcha_settings.json"
+CAPTCHA_PROVIDER = ""                    # "ttshitu" 或 "twocaptcha"
+CAPTCHA_TTSHITU_USERNAME = ""            # 图鉴用户名
+CAPTCHA_TTSHITU_PASSWORD = ""            # 图鉴密码
+CAPTCHA_TWOCAPTCHA_KEY = ""              # 2Captcha API Key
+CAPTCHA_MAX_RETRIES = 3                  # 验证码识别最大重试次数
+CAPTCHA_DETECT_TIMEOUT_MS = 5000         # 验证码检测等待超时(毫秒)
+
 # 日志配置
 LOG_FILE = DATA_DIR / "app.log"
 LOG_MAX_BYTES = 10 * 1024 * 1024        # 单个日志文件最大 10MB

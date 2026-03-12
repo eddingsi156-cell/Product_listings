@@ -66,7 +66,8 @@ def launch_chrome(
         user_data_dir = CHROME_USER_DATA_DIR
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
-    args = [
+    cmd = [
+        chrome_path,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
@@ -77,40 +78,44 @@ def launch_chrome(
         "--disable-dev-shm-usage",
     ]
 
-    args_str = ", ".join(f'"{arg}"' for arg in args)
-    subprocess.run(
-        f'powershell -Command "Start-Process -FilePath \\"{chrome_path}\\" -ArgumentList {args_str}"',
-        shell=True,
+    proc = subprocess.Popen(
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-
-    proc = None
 
     # 等 CDP 端口就绪
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            # 检查进程是否已退出（启动失败）
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"Chrome 进程已退出（退出码 {proc.returncode}）。请手动启动：\n"
+                    f'"{chrome_path}" --remote-debugging-port={port}'
+                )
             if is_cdp_available(port, timeout=1.0):
                 return proc
             time.sleep(0.5)
     except BaseException:
         # 异常时（包括 KeyboardInterrupt）确保 Chrome 进程被清理
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise
+
+    # 超时
+    if proc.poll() is None:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-        raise
-
-    # 超时
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
     raise TimeoutError(
         f"Chrome 启动超时（{timeout}秒）。请手动启动：\n"
         f'"{chrome_path}" --remote-debugging-port={port}'

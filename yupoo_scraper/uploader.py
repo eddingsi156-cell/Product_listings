@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import config
 from .config import (
     MAIN_IMAGE_MAX,
     WEIDIAN_PUBLISH_URL,
@@ -131,6 +132,12 @@ class WeidianUploader:
         except Exception:
             return False
 
+    async def new_page(self):
+        """在当前浏览器上下文中打开新页面。"""
+        if not self._context:
+            raise RuntimeError("浏览器未连接，无法创建页面")
+        return await self._context.new_page()
+
     async def check_login_status(
         self,
         on_status_change: Callable[[bool, str], None] | None = None,
@@ -242,21 +249,19 @@ class WeidianUploader:
 
         last_error = None
         for attempt in range(UPLOAD_RETRY_MAX + 1):
+            page = None
             try:
-                page = await self._context.new_page()
-                try:
-                    result = await self._do_upload(page, product, step)
-                    result.title = product.title
-                    if not result.success:
-                        await self._save_debug_screenshot(page, product.folder.name)
-                        last_error = result.error
-                        # 如果是可重试的错误，等待后重试
-                        if attempt < UPLOAD_RETRY_MAX and last_error:
-                            step(f"上传失败，{UPLOAD_RETRY_DELAY}秒后重试 ({attempt + 1}/{UPLOAD_RETRY_MAX})...")
-                            await asyncio.sleep(UPLOAD_RETRY_DELAY)
-                            continue
-                finally:
-                    await page.close()
+                page = await self.new_page()
+                result = await self._do_upload(page, product, step)
+                result.title = product.title
+                if not result.success:
+                    await self._save_debug_screenshot(page, product.folder.name)
+                    last_error = result.error
+                    # 如果是可重试的错误，等待后重试
+                    if attempt < UPLOAD_RETRY_MAX and last_error:
+                        step(f"上传失败，{UPLOAD_RETRY_DELAY}秒后重试 ({attempt + 1}/{UPLOAD_RETRY_MAX})...")
+                        await asyncio.sleep(UPLOAD_RETRY_DELAY)
+                        continue
                 return result
             except Exception as e:
                 last_error = str(e)
@@ -265,6 +270,9 @@ class WeidianUploader:
                     await asyncio.sleep(UPLOAD_RETRY_DELAY)
                 else:
                     return UploadResult(product.folder, False, last_error, title=product.title)
+            finally:
+                if page:
+                    await page.close()
 
         return UploadResult(product.folder, False, last_error or "重试次数耗尽", title=product.title)
 
@@ -279,6 +287,266 @@ class WeidianUploader:
             logger.info("调试截图已保存: %s", path)
         except Exception as e:
             logger.warning("保存调试截图失败: %s", e)
+
+    async def _handle_captcha(
+        self,
+        page,
+        step: Callable[[str], None],
+    ) -> bool:
+        """检测并处理腾讯滑块验证码 (tcaptcha)。
+
+        Returns:
+            True = 验证码已解决或不存在，False = 解决失败。
+        """
+        # 运行时读取 config，避免模块导入时绑定空值
+        captcha_provider = config.CAPTCHA_PROVIDER
+        if not captcha_provider:
+            await asyncio.sleep(1)
+            return True
+
+        from .captcha_solver import create_solver
+
+        try:
+            solver = create_solver(
+                captcha_provider,
+                username=config.CAPTCHA_TTSHITU_USERNAME,
+                password=config.CAPTCHA_TTSHITU_PASSWORD,
+                api_key=config.CAPTCHA_TWOCAPTCHA_KEY,
+            )
+        except ValueError as e:
+            logger.error("创建打码平台实例失败: %s", e)
+            return False
+
+        # 使用 async with 复用 HTTP 连接（重试时不必每次新建 TCP）
+        async with solver:
+            return await self._solve_captcha_loop(page, step, solver)
+
+    async def _solve_captcha_loop(
+        self,
+        page,
+        step: Callable[[str], None],
+        solver,
+    ) -> bool:
+        """验证码检测 + 重试循环（从 _handle_captcha 拆出以配合 async with）。"""
+        detect_timeout_ms = config.CAPTCHA_DETECT_TIMEOUT_MS
+        max_retries = config.CAPTCHA_MAX_RETRIES
+
+        # 清理上一轮遗留的验证码调试截图
+        try:
+            for old_png in _SCREENSHOT_DIR.glob("captcha_attempt_*.png"):
+                old_png.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        # ── 0. 首次检测：是否弹出了验证码 ──────────────────────
+        await asyncio.sleep(1.5)
+        iframe_loc = page.locator("#tcaptcha_iframe").first
+        try:
+            visible = await iframe_loc.is_visible(timeout=detect_timeout_ms)
+            if not visible:
+                logger.debug("未检测到验证码弹窗")
+                return True
+        except Exception:
+            logger.debug("未检测到验证码弹窗")
+            return True
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                # 重试前等待验证码刷新完毕（不做"有无验证码"判断，
+                # 因为 iframe 可能在刷新过程中短暂消失再重现）
+                await asyncio.sleep(1.5)
+                # 重新获取 locator（iframe 可能被重新挂载）
+                iframe_loc = page.locator("#tcaptcha_iframe").first
+
+            step(f"检测到腾讯滑块验证码 ({attempt + 1}/{max_retries})...")
+
+            # ── 2. 进入 iframe ────────────────────────────────────
+            frame = page.frame_locator("#tcaptcha_iframe")
+
+            # 等待 iframe 内容加载（滑块背景图出现）
+            try:
+                bg_img = frame.locator("#slideBg").first
+                await bg_img.wait_for(state="visible", timeout=5000)
+            except Exception:
+                # 备选选择器
+                try:
+                    bg_img = frame.locator("img.tc-bg-img").first
+                    await bg_img.wait_for(state="visible", timeout=3000)
+                except Exception as e:
+                    logger.warning("等待验证码背景图超时 (第%d次): %s", attempt + 1, e)
+                    # 尝试点刷新
+                    await self._click_captcha_refresh(page, frame)
+                    continue
+
+            # ── 3. 截图验证码区域 ────────────────────────────────
+            try:
+                # 截取整个 iframe 区域（包含背景图+拼图+滑块）
+                screenshot = await iframe_loc.screenshot(type="png")
+            except Exception:
+                try:
+                    # 退而求其次：截取外层容器
+                    container = page.locator("#tcaptcha_transform").first
+                    screenshot = await container.screenshot(type="png")
+                except Exception as e:
+                    logger.error("验证码截图失败 (第%d次): %s", attempt + 1, e)
+                    continue
+
+            # 保存截图用于调试
+            try:
+                _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+                debug_path = _SCREENSHOT_DIR / f"captcha_attempt_{attempt + 1}.png"
+                debug_path.write_bytes(screenshot)
+                logger.info("验证码截图已保存: %s", debug_path)
+            except Exception:
+                pass
+
+            # ── 4. 调打码平台识别缺口位置 ────────────────────────
+            try:
+                gap_x = await solver.recognize_gap(screenshot)
+                logger.info("识别缺口 X=%d (第%d次)", gap_x, attempt + 1)
+            except Exception as e:
+                logger.warning("验证码识别失败 (第%d次): %s", attempt + 1, e)
+                await self._click_captcha_refresh(page, frame)
+                continue
+
+            # ── 5. 查找滑块拖动按钮 ──────────────────────────────
+            slider_selectors = [
+                "#tcaptcha_drag_button",
+                ".tc-drag-thumb",
+                "#tcaptcha_drag_thumb",
+            ]
+
+            slider = None
+            for sel in slider_selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if await loc.is_visible(timeout=2000):
+                        slider = loc
+                        break
+                except Exception:
+                    continue
+
+            if not slider:
+                logger.warning("未找到滑块按钮 (第%d次)", attempt + 1)
+                await self._click_captcha_refresh(page, frame)
+                continue
+
+            # ── 6. 计算滑动距离并执行拖拽 ────────────────────────
+            # gap_x 是相对于截图（=iframe 区域）的像素坐标
+            # 腾讯验证码的滑块初始位置在左侧约 30px 处
+            # 需要减去滑块起始位置得到实际滑动距离
+            slider_box = await slider.bounding_box()
+            iframe_box = await iframe_loc.bounding_box()
+
+            if not slider_box or not iframe_box:
+                logger.warning("无法获取元素位置 (第%d次)", attempt + 1)
+                continue
+
+            # 滑块相对于 iframe 左边的偏移
+            slider_offset_x = slider_box["x"] - iframe_box["x"]
+            slide_distance = max(1, gap_x - slider_offset_x - slider_box["width"] / 2)
+
+            step(f"缺口 X={gap_x}, 滑块偏移={slider_offset_x:.0f}, "
+                 f"滑动距离={slide_distance:.0f}px")
+
+            # 腾讯验证码在 iframe 内，但鼠标操作在主页面坐标系
+            # perform_slide 需要用主页面的 page 对象
+            try:
+                # 用主页面坐标系定位滑块
+                start_x = slider_box["x"] + slider_box["width"] / 2
+                start_y = slider_box["y"] + slider_box["height"] / 2
+                await self._perform_tc_slide(
+                    page, start_x, start_y, int(slide_distance),
+                )
+            except Exception as e:
+                logger.warning("滑块拖拽失败 (第%d次): %s", attempt + 1, e)
+                continue
+
+            # ── 7. 轮询等待验证结果（最多 8 秒） ──────────────────
+            captcha_passed = False
+            for _poll in range(16):  # 16 × 0.5s = 8s
+                await asyncio.sleep(0.5)
+                try:
+                    still_visible = await iframe_loc.is_visible(timeout=500)
+                    if not still_visible:
+                        captcha_passed = True
+                        break
+                except Exception:
+                    # 元素已从 DOM 移除 = 通过
+                    captcha_passed = True
+                    break
+
+            if captcha_passed:
+                step("验证码通过 ✓")
+                return True
+
+            # 检查是否显示失败提示（如"尝试太多了"、"拼图位置不正确"）
+            try:
+                header = page.locator("#transform_header").first
+                if await header.is_visible(timeout=1000):
+                    msg = await header.inner_text()
+                    logger.info("验证码提示: %s (第%d次)", msg, attempt + 1)
+                    # 等待自动刷新
+                    await asyncio.sleep(3)
+            except Exception:
+                pass
+
+            logger.info("验证码可能未通过，重试中...")
+
+        logger.error("验证码识别 %d 次均失败", max_retries)
+        return False
+
+    @staticmethod
+    async def _click_captcha_refresh(page, frame) -> None:
+        """点击腾讯验证码的刷新按钮。"""
+        # 先尝试外层刷新按钮
+        for sel in ["#ticon_refresh", ".ticon-refresh"]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    await asyncio.sleep(2)
+                    return
+            except Exception:
+                continue
+
+        # 再尝试 iframe 内的刷新
+        for sel in [".tc-action-icon:has(.tc-icon-refresh)", "#reload"]:
+            try:
+                btn = frame.locator(sel).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    await asyncio.sleep(2)
+                    return
+            except Exception:
+                continue
+
+    @staticmethod
+    async def _perform_tc_slide(
+        page, start_x: float, start_y: float, distance: int,
+    ) -> None:
+        """在主页面坐标系执行腾讯验证码的滑块拖拽。
+
+        腾讯验证码在 iframe 内，但鼠标事件需要在主页面坐标执行。
+        复用 captcha_solver 中的人类化轨迹生成算法。
+        """
+        from .captcha_solver import generate_human_track
+
+        await page.mouse.move(start_x, start_y)
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+
+        track = generate_human_track(distance)
+        cx, cy = start_x, start_y
+        for dx, dy, dt in track:
+            cx += dx
+            cy += dy
+            await page.mouse.move(cx, cy)
+            await asyncio.sleep(dt / 1000)
+
+        await asyncio.sleep(random.uniform(0.05, 0.2))
+        await page.mouse.up()
 
     async def _upload_images_via_dialog(
         self,
@@ -298,6 +566,9 @@ class WeidianUploader:
         Returns:
             错误信息字符串，None 表示成功。
         """
+        if not image_paths:
+            return f"{step_prefix} 没有可上传的图片"
+
         n_upload = len(image_paths)
 
         # 切换到"上传图片"标签（默认在"选择图片"标签）
@@ -362,10 +633,6 @@ class WeidianUploader:
         try:
             await page.goto("about:blank")
             await page.goto(WEIDIAN_PUBLISH_URL, wait_until="networkidle")
-            await page.evaluate("""() => {
-                localStorage.clear();
-                sessionStorage.clear();
-            }""")
             await page.locator(".upload-img-card").first.wait_for(
                 state="visible", timeout=_STEP_TIMEOUT_MS,
             )
@@ -451,6 +718,14 @@ class WeidianUploader:
             await create_btn.wait_for(state="visible", timeout=_STEP_TIMEOUT_MS)
             await create_btn.click()
 
+            # ── 8a. 检测并处理滑块验证码 ────────────────────────
+            captcha_solved = await self._handle_captcha(page, step)
+            if not captcha_solved:
+                return UploadResult(
+                    product.folder, False,
+                    f"8/{total_steps} 滑块验证码识别失败",
+                )
+
             # 等待成功标志出现 - 增强检测逻辑
             success_indicators = [
                 page.locator("text=创建成功"),
@@ -462,7 +737,6 @@ class WeidianUploader:
                 page.locator("text=保存成功"),
                 page.locator("text=操作成功"),
                 page.locator(".el-message--success"),
-                page.locator("[class*=success]"),
             ]
             confirmed_success = False
             success_text = None
@@ -497,7 +771,7 @@ class WeidianUploader:
 
                 all_text = (page_text + " " + dialog_text).lower()
 
-                if any(kw in all_text for kw in ["创建成功", "发布成功", "上架成功", "上架商品成功", "保存成功", "操作成功", "success", "完成"]):
+                if any(kw in all_text for kw in ["创建成功", "发布成功", "上架成功", "上架商品成功", "保存成功", "操作成功", "success"]):
                     confirmed_success = True
                     success_text = "检测到成功提示"
 

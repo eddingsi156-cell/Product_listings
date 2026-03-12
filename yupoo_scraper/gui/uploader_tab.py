@@ -103,33 +103,35 @@ class UploadWorker(BaseWorker):
         self._uploader = None
         self._login_confirmed = False
         self._paused = False
-        import threading
-        self._login_confirm_event = threading.Event()
-        self._pause_event = threading.Event()
-        self._pause_event.set()
+        # asyncio.Event 在事件循环中创建，这里先占位
+        self._login_confirm_event: asyncio.Event | None = None
+        self._pause_event: asyncio.Event | None = None
 
     def pause(self) -> None:
-        """暂停上架。"""
+        """暂停上架（GUI 线程调用，线程安全）。"""
         self._paused = True
-        self._pause_event.clear()
 
     def resume(self) -> None:
-        """继续上架。"""
+        """继续上架（GUI 线程调用，线程安全）。"""
         self._paused = False
-        self._pause_event.set()
 
     def confirm_login(self) -> None:
-        """由 GUI 调用，确认用户已登录。"""
+        """由 GUI 调用，确认用户已登录（线程安全）。"""
         self._login_confirmed = True
-        self._login_confirm_event.set()
 
     def cleanup_chrome(self) -> None:
         """清理由本 worker 启动的 Chrome 进程（线程安全）。"""
+        import subprocess as _sp
+
         proc = self._chrome_proc
         if proc is not None:
             try:
-                proc.terminate()
-                proc.wait(timeout=5)
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+            except _sp.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             except OSError:
                 pass
             self._chrome_proc = None
@@ -149,7 +151,7 @@ class UploadWorker(BaseWorker):
             asyncio.set_event_loop(None)
 
     async def _run_async(self) -> list[UploadResult]:
-        from ..uploader import WEIDIAN_PUBLISH_URL
+        from ..config import WEIDIAN_PUBLISH_URL
 
         self._uploader = WeidianUploader()
 
@@ -159,7 +161,7 @@ class UploadWorker(BaseWorker):
             self.step_update.emit("正在启动 Chrome 浏览器...")
             try:
                 self._chrome_proc = launch_chrome()
-            except (FileNotFoundError, TimeoutError) as e:
+            except (FileNotFoundError, TimeoutError, RuntimeError) as e:
                 raise RuntimeError(str(e)) from e
 
         self.step_update.emit("正在连接浏览器...")
@@ -171,7 +173,7 @@ class UploadWorker(BaseWorker):
         # 跳转到微店发布页
         self.step_update.emit("正在打开微店后台...")
         try:
-            page = await self._uploader._context.new_page()
+            page = await self._uploader.new_page()
             await page.goto(WEIDIAN_PUBLISH_URL, wait_until="domcontentloaded")
             await page.close()
         except Exception as e:
@@ -181,8 +183,11 @@ class UploadWorker(BaseWorker):
         self.step_update.emit("请在浏览器中登录微店，登录后点击确认...")
         self.ready_for_login.emit()
 
-        # 等待用户确认登录
-        self._login_confirm_event.wait()
+        # 等待用户确认登录（asyncio 友好，不阻塞事件循环）
+        while not self._login_confirmed and not self._cancelled:
+            await asyncio.sleep(0.5)
+        if self._cancelled:
+            return []
         self.step_update.emit("开始上架...")
 
         try:
@@ -198,9 +203,7 @@ class UploadWorker(BaseWorker):
                     break
 
                 while self._paused and not self._cancelled:
-                    self._pause_event.wait()
-                    if self._cancelled:
-                        break
+                    await asyncio.sleep(0.5)
 
                 if self._cancelled:
                     for p in self._products[i:]:
@@ -375,14 +378,27 @@ class UploaderTab(QWidget):
         sel_layout.addStretch()
         main_layout.addLayout(sel_layout)
 
-        # ── 浏览器连接 + 控制 ─────────────────────────────────────
+        # ── 浏览器连接 + 验证码 + 控制 ─────────────────────────────
         conn_layout = QHBoxLayout()
         conn_layout.addWidget(QLabel("CDP 地址:"))
         self._cdp_input = QLineEdit(config.WEIDIAN_CDP_URL)
         self._cdp_input.setFixedWidth(200)
         conn_layout.addWidget(self._cdp_input)
 
-        conn_layout.addSpacing(16)
+        conn_layout.addSpacing(12)
+
+        # 验证码设置按钮 + 状态
+        self._btn_captcha_settings = QPushButton("验证码设置")
+        self._btn_captcha_settings.setFixedWidth(90)
+        self._btn_captcha_settings.clicked.connect(self._on_open_captcha_settings)
+        conn_layout.addWidget(self._btn_captcha_settings)
+
+        self._captcha_status_label = QLabel()
+        self._captcha_status_label.setStyleSheet("font-size: 11px;")
+        conn_layout.addWidget(self._captcha_status_label)
+        self._update_captcha_status_label()
+
+        conn_layout.addSpacing(12)
 
         self._btn_upload = QPushButton("开始上架")
         self._btn_upload.clicked.connect(self._on_upload)
@@ -429,6 +445,36 @@ class UploaderTab(QWidget):
         rh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
         main_layout.addWidget(self._result_table)
+
+    # ── 验证码设置 ────────────────────────────────────────────────
+
+    @Slot()
+    def _on_open_captcha_settings(self) -> None:
+        """打开验证码设置对话框。"""
+        from .captcha_settings_dialog import CaptchaSettingsDialog
+
+        dlg = CaptchaSettingsDialog(self)
+        dlg.settings_changed.connect(self._update_captcha_status_label)
+        dlg.exec()
+
+    def _update_captcha_status_label(self) -> None:
+        """根据当前 config 更新验证码状态显示。"""
+        provider = config.CAPTCHA_PROVIDER
+        if provider == "ttshitu":
+            user = config.CAPTCHA_TTSHITU_USERNAME
+            text = f"[图鉴: {user}]" if user else "[图鉴: 未填写账号]"
+            color = "#2E7D32" if user else "#C62828"
+        elif provider in ("twocaptcha", "2captcha"):
+            has_key = bool(config.CAPTCHA_TWOCAPTCHA_KEY)
+            text = "[2Captcha: 已配置]" if has_key else "[2Captcha: 未填写Key]"
+            color = "#2E7D32" if has_key else "#C62828"
+        else:
+            text = "[未配置]"
+            color = "#888"
+        self._captcha_status_label.setText(text)
+        self._captcha_status_label.setStyleSheet(
+            f"font-size: 11px; color: {color};"
+        )
 
     # ── 价格模式切换 ────────────────────────────────────────────────
 
@@ -771,8 +817,8 @@ class UploaderTab(QWidget):
         if self._upload_worker:
             self._upload_worker.confirm_login()
         self._btn_confirm_login.setEnabled(False)
-        self._btn_stop.setEnabled(False)
-        self._btn_pause.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._btn_pause.setEnabled(True)
         self._btn_pause.setText("暂停")
 
     @Slot(int, int)

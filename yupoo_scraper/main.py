@@ -55,6 +55,10 @@ def main() -> None:
     _setup_logging()
     _install_excepthook()
 
+    # 加载持久化的验证码设置（在 GUI 初始化之前）
+    from .gui.captcha_settings_dialog import load_captcha_settings_on_startup
+    load_captcha_settings_on_startup()
+
     app = QApplication(sys.argv)
 
     # 用 qasync 将 asyncio 事件循环嵌入 Qt 事件循环
