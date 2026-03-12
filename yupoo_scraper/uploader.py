@@ -451,24 +451,50 @@ class WeidianUploader:
             dpr = await page.evaluate("window.devicePixelRatio || 1")
             gap_x_css = gap_x / dpr
 
+            # 获取拼图块 #slideBlock 的初始 CSS left 值（相对于背景图容器）
+            # 拼图块不从背景图 X=0 开始，通常 left≈26px
+            piece_left_css = None
+            try:
+                # frame_locator 不能直接 evaluate，需通过 page.frame() 获取 Frame
+                tc_frame = None
+                for f in page.frames:
+                    if "cap_union_new_show" in (f.url or ""):
+                        tc_frame = f
+                        break
+                if tc_frame:
+                    piece_left_css = await tc_frame.evaluate("""() => {
+                        const el = document.getElementById('slideBlock');
+                        if (!el) return null;
+                        const left = parseFloat(el.style.left);
+                        const width = parseFloat(el.style.width) || el.offsetWidth;
+                        return {left: left, width: width};
+                    }""")
+            except Exception as e:
+                logger.debug("获取 slideBlock left 失败: %s", e)
+
             # 根据截图来源选择坐标基准：
             # - 背景图截图 → gap_x_css 相对于 bg_box
             # - iframe 全截图 → gap_x_css 相对于 iframe_box
             ref_box = bg_box if used_bg_screenshot else iframe_box
-            gap_page_x = ref_box["x"] + gap_x_css
+            gap_x_in_bg = gap_x_css if used_bg_screenshot else (gap_x_css - (bg_box["x"] - iframe_box["x"]))
 
-            # 滑动距离 = 缺口在背景图中的 X 坐标
-            # 拼图块从背景图左侧起始，拖拽 D 像素 → 拼图块移动 D 像素
-            # 所以距离就是 gap_x_css 相对于背景图左边缘的偏移
-            # 注意：之前用 gap_page_x - slider_center_x 会偏短半个滑块宽度
-            slide_distance = max(1, int(gap_page_x - bg_box["x"]))
+            # 滑动距离 = 缺口在背景图内的X - 拼图块在背景图内的初始X（左边缘对齐）
+            if piece_left_css and piece_left_css.get("left") is not None:
+                piece_left = piece_left_css["left"]
+                slide_distance = max(1, int(gap_x_in_bg - piece_left))
+                logger.info(
+                    "拼图块 CSS left=%.0f, width=%.0f",
+                    piece_left, piece_left_css.get("width", 0),
+                )
+            else:
+                # 降级：无法获取拼图块位置时，用背景图左边缘作为基准
+                logger.warning("未找到拼图块 left 样式，降级用背景图左边缘")
+                slide_distance = max(1, int(gap_x_in_bg))
 
             logger.info(
                 "DPR=%.2f, 截图gap_x=%d, CSS gap_x=%.1f, "
-                "基准=%s(X=%.0f), bg_box.x=%.0f, 滑动距离=%d",
-                dpr, gap_x, gap_x_css,
-                "bg" if used_bg_screenshot else "iframe",
-                ref_box["x"], bg_box["x"], slide_distance,
+                "gap_x_in_bg=%.1f, 滑动距离=%d",
+                dpr, gap_x, gap_x_css, gap_x_in_bg, slide_distance,
             )
             step(f"缺口 X={gap_x}(截图)/{gap_x_css:.0f}(CSS), "
                  f"滑动距离={slide_distance}px")
