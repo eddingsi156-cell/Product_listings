@@ -9,7 +9,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,8 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +41,15 @@ from ..organizer import find_image_folders
 from .dedup_review_dialog import DELETE_EXISTING, DELETE_NEW, DedupReviewDialog
 from .feature_store_dialog import FeatureStoreBrowserDialog
 from .split_dialog import FlowLayout, ThumbnailWidget
+from .models import (
+    ButtonDelegate,
+    ROLE_ACTION_COLOR,
+    ROLE_ACTION_TEXT,
+    ROLE_ACTION_TOOLTIP,
+    ROLE_ACTION_TYPE,
+    ROLE_RAW_DATA,
+    VirtualTableModel,
+)
 from .widgets import StatusProgressBar
 
 
@@ -142,32 +150,54 @@ class DedupRegisterWorker(BaseWorker):
         errors = 0
         total = len(self._items)
         today = date.today().isoformat()
+        batch_size = config.REGISTER_BATCH_SIZE
 
-        for i, item in enumerate(self._items):
+        # 收集有效项
+        valid_items = [
+            item for item in self._items
+            if item.embedding is not None
+        ]
+
+        # 分批注册（每批 batch_size 个，单事务 + 单次 FAISS 写入）
+        for batch_start in range(0, len(valid_items), batch_size):
             if self._cancelled:
                 break
-            if item.embedding is None:
-                continue
+
+            batch = valid_items[batch_start:batch_start + batch_size]
+            batch_tuples = [
+                (item.name, "", str(item.folder), "", today,
+                 item.image_count, item.embedding)
+                for item in batch
+            ]
 
             try:
-                self._dedup.register_product(
-                    name=item.name,
-                    store="",
-                    folder=str(item.folder),
-                    source_url="",
-                    download_date=today,
-                    image_count=item.image_count,
-                    embedding=item.embedding,
-                    save=False,
-                )
-                count += 1
+                self._dedup.register_products_batch(batch_tuples)
+                count += len(batch)
             except Exception as e:
-                errors += 1
-                logger.warning("注册产品失败 %s: %s", item.name, e)
+                # 批量失败时回退到逐个注册
+                logger.warning("批量注册失败，回退逐个注册: %s", e)
+                for item in batch:
+                    if self._cancelled:
+                        break
+                    try:
+                        self._dedup.register_product(
+                            name=item.name, store="",
+                            folder=str(item.folder), source_url="",
+                            download_date=today,
+                            image_count=item.image_count,
+                            embedding=item.embedding,
+                            save=False,
+                        )
+                        count += 1
+                    except Exception as e2:
+                        errors += 1
+                        logger.warning("注册产品失败 %s: %s", item.name, e2)
 
-            self.progress.emit(i + 1, total)
+            self.progress.emit(
+                min(batch_start + len(batch), total), total
+            )
 
-        # 批量注册结束后统一持久化 FAISS 索引（一次写盘）
+        # 最终持久化 FAISS 索引
         self._dedup.save_index()
 
         if errors > 0:
@@ -222,6 +252,256 @@ class ProductImageDialog(QDialog):
         layout.addLayout(btn_layout)
 
 
+# ── DedupTableModel ──────────────────────────────────────────
+
+class DedupTableModel(VirtualTableModel):
+    """查重结果表格模型。"""
+
+    _HEADERS = ["状态", "文件夹名称", "图片数", "相似度", "匹配产品", "操作"]
+
+    # 额外的状态标记（注册后覆盖原始 status 文本）
+    # row → override text, 不修改原始数据
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._registered_rows: set[int] = set()   # 已入库的行
+        self._deleted_rows: dict[int, str] = {}   # 已删除的行 → 标签
+
+    @property
+    def _headers(self) -> list[str]:
+        return self._HEADERS
+
+    def _column_data(self, row, col, role):
+        item: DedupScanItem = self._items[row]
+
+        # 背景色
+        if role == Qt.ItemDataRole.BackgroundRole:
+            return self._get_bg_color(row, item)
+
+        # 文本对齐
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in (0, 2, 3):
+                return int(Qt.AlignmentFlag.AlignCenter)
+            return None
+
+        # 原始数据
+        if role == ROLE_RAW_DATA:
+            return item
+
+        # 操作列用自定义角色
+        if col == 5:
+            return self._action_data(row, item, role)
+
+        # DisplayRole
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 0:
+                return self._status_text(row, item)
+            elif col == 1:
+                return item.name
+            elif col == 2:
+                return str(item.image_count)
+            elif col == 3:
+                if item.best_match:
+                    return f"{item.best_match.similarity:.4f}"
+                return "—"
+            elif col == 4:
+                if item.best_match:
+                    return item.best_match.existing_product.name
+                return "—"
+
+        # ForegroundRole (状态列)
+        if role == Qt.ItemDataRole.ForegroundRole and col == 0:
+            return self._status_color(row, item)
+
+        # ToolTipRole
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if col == 0:
+                return self._status_tooltip(row, item)
+
+        return None
+
+    def _status_text(self, row: int, item: DedupScanItem) -> str:
+        if row in self._deleted_rows:
+            return self._deleted_rows[row]
+        if row in self._registered_rows:
+            return "已入库"
+        if item.error:
+            return "X"
+        if item.status == DedupStatus.DUPLICATE:
+            return "重复"
+        if item.status == DedupStatus.REVIEW:
+            return "待审"
+        return "新"
+
+    def _status_color(self, row: int, item: DedupScanItem) -> QColor | None:
+        if row in self._deleted_rows:
+            return QColor(Qt.GlobalColor.gray)
+        if row in self._registered_rows:
+            return QColor(Qt.GlobalColor.darkGreen)
+        if item.error:
+            return QColor(Qt.GlobalColor.red)
+        if item.status == DedupStatus.DUPLICATE:
+            return QColor(Qt.GlobalColor.red)
+        if item.status == DedupStatus.REVIEW:
+            return QColor(Qt.GlobalColor.darkYellow)
+        return QColor(Qt.GlobalColor.darkGreen)
+
+    def _status_tooltip(self, row: int, item: DedupScanItem) -> str | None:
+        if item.error:
+            return item.error
+        if item.status == DedupStatus.DUPLICATE:
+            return "自动标记重复"
+        if item.status == DedupStatus.REVIEW:
+            return "需人工审核"
+        return "新产品"
+
+    def _get_bg_color(self, row: int, item: DedupScanItem) -> QColor | None:
+        if row in self._deleted_rows:
+            return _COLOR_ERROR
+        if item.error:
+            return _COLOR_ERROR
+        if item.status == DedupStatus.DUPLICATE:
+            return _COLOR_DUPLICATE
+        if item.status == DedupStatus.REVIEW:
+            return _COLOR_REVIEW
+        if item.status == DedupStatus.NEW:
+            return _COLOR_NEW
+        return None
+
+    def _action_data(self, row: int, item: DedupScanItem, role: int):
+        if role == ROLE_ACTION_TYPE:
+            if row in self._deleted_rows:
+                return "label"
+            if row in self._registered_rows:
+                return "label"
+            if item.error:
+                return "label"
+            if item.status in (DedupStatus.DUPLICATE, DedupStatus.REVIEW):
+                return "button"
+            return "label"
+
+        if role == ROLE_ACTION_TEXT:
+            if row in self._deleted_rows:
+                return self._deleted_rows[row]
+            if row in self._registered_rows:
+                return "已入库"
+            if item.error:
+                return "出错"
+            if item.status in (DedupStatus.DUPLICATE, DedupStatus.REVIEW):
+                return "审核"
+            return "新产品"
+
+        if role == ROLE_ACTION_COLOR:
+            if row in self._deleted_rows:
+                return "gray"
+            if row in self._registered_rows:
+                return "green"
+            if item.error:
+                return "red"
+            if item.status == DedupStatus.NEW:
+                return "green"
+            return None
+
+        if role == ROLE_ACTION_TOOLTIP:
+            if item.error:
+                return item.error
+            return None
+
+        return None
+
+    def mark_registered(self, row: int) -> None:
+        """标记为已入库。"""
+        self._registered_rows.add(row)
+        left = self.index(row, 0)
+        right = self.index(row, self.columnCount() - 1)
+        self.dataChanged.emit(left, right)
+
+    def mark_deleted(self, row: int, label: str) -> None:
+        """标记为已删除。"""
+        self._deleted_rows[row] = label
+        left = self.index(row, 0)
+        right = self.index(row, self.columnCount() - 1)
+        self.dataChanged.emit(left, right)
+
+    def mark_all_new_registered(self) -> None:
+        """批量标记所有 NEW 行为已入库。"""
+        for row, item in enumerate(self._items):
+            if (row not in self._registered_rows
+                    and row not in self._deleted_rows
+                    and item.status == DedupStatus.NEW
+                    and not item.error
+                    and item.embedding is not None):
+                self._registered_rows.add(row)
+        # 批量通知
+        if self._items:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._items) - 1, self.columnCount() - 1),
+            )
+
+    def remove_item(self, row: int) -> None:
+        """删除指定行，同时调整索引集合避免状态错乱。"""
+        if row < 0 or row >= len(self._items):
+            return
+        # 调整 _registered_rows：移除该行，大于该行的索引减 1
+        new_registered: set[int] = set()
+        for r in self._registered_rows:
+            if r < row:
+                new_registered.add(r)
+            elif r > row:
+                new_registered.add(r - 1)
+            # r == row: 丢弃
+        self._registered_rows = new_registered
+
+        # 调整 _deleted_rows：同理
+        new_deleted: dict[int, str] = {}
+        for r, label in self._deleted_rows.items():
+            if r < row:
+                new_deleted[r] = label
+            elif r > row:
+                new_deleted[r - 1] = label
+        self._deleted_rows = new_deleted
+
+        super().remove_item(row)
+
+    def clear(self) -> None:
+        self._registered_rows.clear()
+        self._deleted_rows.clear()
+        super().clear()
+
+
+# ── DedupFilterProxy ─────────────────────────────────────────
+
+class DedupFilterProxy(QSortFilterProxyModel):
+    """查重结果筛选代理模型。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_id = _FILTER_ALL
+
+    def set_filter(self, filter_id: int) -> None:
+        self._filter_id = filter_id
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if self._filter_id == _FILTER_ALL:
+            return True
+
+        model = self.sourceModel()
+        item = model.get_item(source_row)
+        if item is None:
+            return False
+
+        if self._filter_id == _FILTER_DUPLICATE:
+            return item.status == DedupStatus.DUPLICATE
+        elif self._filter_id == _FILTER_REVIEW:
+            return item.status == DedupStatus.REVIEW
+        elif self._filter_id == _FILTER_NEW:
+            return item.status == DedupStatus.NEW and not item.error
+        elif self._filter_id == _FILTER_ERROR:
+            return bool(item.error)
+        return True
+
+
 # ── DedupTab ──────────────────────────────────────────────────
 
 class DedupTab(QWidget):
@@ -236,7 +516,7 @@ class DedupTab(QWidget):
         self._init_worker: DedupInitWorker | None = None
         self._scan_worker: DedupScanWorker | None = None
         self._register_worker: DedupRegisterWorker | None = None
-        self._scan_results: list[DedupScanItem] = []
+        self._folder_scan_worker: BaseWorker | None = None
         self._current_filter = _FILTER_ALL
         self._build_ui()
 
@@ -324,11 +604,13 @@ class DedupTab(QWidget):
 
         main_layout.addLayout(filter_layout)
 
-        # ── 结果表格 ──────────────────────────────────────────
-        self._table = QTableWidget(0, 6)
-        self._table.setHorizontalHeaderLabels(
-            ["状态", "文件夹名称", "图片数", "相似度", "匹配产品", "操作"]
-        )
+        # ── 结果表格 (Model/View) ────────────────────────────
+        self._model = DedupTableModel(self)
+        self._proxy = DedupFilterProxy(self)
+        self._proxy.setSourceModel(self._model)
+
+        self._table = QTableView()
+        self._table.setModel(self._proxy)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
@@ -340,6 +622,12 @@ class DedupTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+
+        # 操作列委托
+        self._action_delegate = ButtonDelegate(
+            on_click=self._on_review, parent=self._table
+        )
+        self._table.setItemDelegateForColumn(5, self._action_delegate)
 
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_table_context_menu)
@@ -355,6 +643,13 @@ class DedupTab(QWidget):
         self._btn_register_all.clicked.connect(self._on_register_all_new)
         bottom_layout.addWidget(self._btn_register_all)
         main_layout.addLayout(bottom_layout)
+
+    # ── 便捷属性 ─────────────────────────────────────────────
+
+    @property
+    def _scan_results(self) -> list[DedupScanItem]:
+        """兼容旧代码的访问方式。"""
+        return self._model.items
 
     # ── Deduplicator 懒初始化 ────────────────────────────────
 
@@ -399,8 +694,7 @@ class DedupTab(QWidget):
             return
 
         # 重置状态
-        self._scan_results.clear()
-        self._table.setRowCount(0)
+        self._model.clear()
         self._update_summary()
         self._btn_register_all.setEnabled(False)
         self._btn_scan.setEnabled(False)
@@ -416,20 +710,43 @@ class DedupTab(QWidget):
             self._start_init_worker()
 
     def _scan_new_folders(self, dedup: Deduplicator) -> None:
-        """扫描新文件夹并启动扫描 Worker（复用已有 Deduplicator）。"""
+        """后台扫描新文件夹，完成后启动扫描 Worker。"""
+        self._progress.set_status("正在扫描文件夹...")
+
+        class FolderScanWorker(BaseWorker):
+            """后台扫描新文件夹（避免阻塞主线程）。"""
+            folders_ready = Signal(list)
+
+            def __init__(self, download_dir: Path, registered: set[str]):
+                super().__init__()
+                self._download_dir = download_dir
+                self._registered = registered
+
+            def _run(self) -> None:
+                all_folders = (
+                    find_image_folders(self._download_dir)
+                    if self._download_dir.exists()
+                    else []
+                )
+                folders = [f for f in all_folders if str(f) not in self._registered]
+                self.folders_ready.emit(folders)
+
         registered = dedup.get_registered_folders()
-        # 复用 find_image_folders 而非在主线程手动遍历
-        all_folders = find_image_folders(self._download_dir) if self._download_dir.exists() else []
-        folders = [f for f in all_folders if str(f) not in registered]
+        self._folder_scan_worker = FolderScanWorker(self._download_dir, registered)
 
-        if not folders:
-            self._progress.set_status("未找到新的产品文件夹")
-            self.status_message.emit("未找到新的产品文件夹（所有文件夹已在库中）")
-            self._btn_scan.setEnabled(True)
-            self._btn_stop.setEnabled(False)
-            return
+        def on_folders_ready(folders: list) -> None:
+            self._folder_scan_worker = None
+            if not folders:
+                self._progress.set_status("未找到新的产品文件夹")
+                self.status_message.emit("未找到新的产品文件夹（所有文件夹已在库中）")
+                self._btn_scan.setEnabled(True)
+                self._btn_stop.setEnabled(False)
+                return
+            self._start_scan_worker(dedup, folders)
 
-        self._start_scan_worker(dedup, folders)
+        self._folder_scan_worker.folders_ready.connect(on_folders_ready)
+        self._folder_scan_worker.finished_err.connect(self._on_error)
+        self._folder_scan_worker.start()
 
     def _start_init_worker(self) -> None:
         """启动后台初始化 + 文件夹扫描 Worker。"""
@@ -501,8 +818,7 @@ class DedupTab(QWidget):
 
     @Slot(int, int, object)
     def _on_folder_done(self, idx: int, total: int, item: DedupScanItem) -> None:
-        self._scan_results.append(item)
-        self._add_table_row(item)
+        self._model.append_item(item)
         self._progress.set_progress(idx + 1, total)
         self._update_summary()
 
@@ -510,10 +826,11 @@ class DedupTab(QWidget):
     def _on_finished(self, results: list) -> None:
         self._btn_scan.setEnabled(True)
         self._btn_stop.setEnabled(False)
-        n = len(self._scan_results)
-        n_dup = sum(1 for r in self._scan_results if r.status == DedupStatus.DUPLICATE)
-        n_review = sum(1 for r in self._scan_results if r.status == DedupStatus.REVIEW)
-        n_new = sum(1 for r in self._scan_results
+        items = self._scan_results
+        n = len(items)
+        n_dup = sum(1 for r in items if r.status == DedupStatus.DUPLICATE)
+        n_review = sum(1 for r in items if r.status == DedupStatus.REVIEW)
+        n_new = sum(1 for r in items
                     if r.status == DedupStatus.NEW and not r.error)
 
         self._progress.set_status(
@@ -537,140 +854,21 @@ class DedupTab(QWidget):
         self.status_message.emit(f"查重出错: {error}")
         self._scan_worker = None
 
-    # ── 表格操作 ───────────────────────────────────────────────
-
-    def _add_table_row(self, item: DedupScanItem) -> None:
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        bg_color = self._get_row_color(item)
-
-        # 状态列
-        status_item = QTableWidgetItem()
-        status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._update_status_cell(status_item, item)
-        if bg_color:
-            status_item.setBackground(bg_color)
-        self._table.setItem(row, 0, status_item)
-
-        # 文件夹名称
-        name_item = QTableWidgetItem(item.name)
-        if bg_color:
-            name_item.setBackground(bg_color)
-        self._table.setItem(row, 1, name_item)
-
-        # 图片数
-        count_item = QTableWidgetItem(str(item.image_count))
-        count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        if bg_color:
-            count_item.setBackground(bg_color)
-        self._table.setItem(row, 2, count_item)
-
-        # 相似度
-        if item.best_match:
-            sim_text = f"{item.best_match.similarity:.4f}"
-        else:
-            sim_text = "—"
-        sim_item = QTableWidgetItem(sim_text)
-        sim_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        if bg_color:
-            sim_item.setBackground(bg_color)
-        self._table.setItem(row, 3, sim_item)
-
-        # 匹配产品
-        if item.best_match:
-            match_text = item.best_match.existing_product.name
-        else:
-            match_text = "—"
-        match_item = QTableWidgetItem(match_text)
-        if bg_color:
-            match_item.setBackground(bg_color)
-        self._table.setItem(row, 4, match_item)
-
-        # 操作列
-        self._set_action_widget(row, item)
-
-        self._apply_row_filter(row)
-
-    def _set_action_widget(self, row: int, item: DedupScanItem) -> None:
-        """设置操作列的 widget。"""
-        if item.error:
-            lbl = QLabel("出错")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: red;")
-            lbl.setToolTip(item.error)
-            self._table.setCellWidget(row, 5, lbl)
-        elif item.status in (DedupStatus.DUPLICATE, DedupStatus.REVIEW):
-            btn = QPushButton("审核")
-            btn.clicked.connect(lambda _=None, r=row: self._on_review(r))
-            self._table.setCellWidget(row, 5, btn)
-        else:
-            lbl = QLabel("新产品")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: green;")
-            self._table.setCellWidget(row, 5, lbl)
-
-    def _update_status_cell(self, cell: QTableWidgetItem, item: DedupScanItem) -> None:
-        if item.error:
-            cell.setText("X")
-            cell.setToolTip(item.error)
-            cell.setForeground(Qt.GlobalColor.red)
-        elif item.status == DedupStatus.DUPLICATE:
-            cell.setText("重复")
-            cell.setToolTip("自动标记重复")
-            cell.setForeground(Qt.GlobalColor.red)
-        elif item.status == DedupStatus.REVIEW:
-            cell.setText("待审")
-            cell.setToolTip("需人工审核")
-            cell.setForeground(Qt.GlobalColor.darkYellow)
-        else:
-            cell.setText("新")
-            cell.setToolTip("新产品")
-            cell.setForeground(Qt.GlobalColor.darkGreen)
-
-    @staticmethod
-    def _get_row_color(item: DedupScanItem) -> QColor | None:
-        if item.error:
-            return _COLOR_ERROR
-        elif item.status == DedupStatus.DUPLICATE:
-            return _COLOR_DUPLICATE
-        elif item.status == DedupStatus.REVIEW:
-            return _COLOR_REVIEW
-        elif item.status == DedupStatus.NEW:
-            return _COLOR_NEW
-        return None
-
     # ── 筛选 ───────────────────────────────────────────────────
 
     @Slot(int)
     def _on_filter_changed(self, filter_id: int) -> None:
         self._current_filter = filter_id
-        for row in range(self._table.rowCount()):
-            self._apply_row_filter(row)
-
-    def _apply_row_filter(self, row: int) -> None:
-        if row >= len(self._scan_results):
-            return
-        item = self._scan_results[row]
-
-        if self._current_filter == _FILTER_ALL:
-            self._table.setRowHidden(row, False)
-        elif self._current_filter == _FILTER_DUPLICATE:
-            self._table.setRowHidden(row, item.status != DedupStatus.DUPLICATE)
-        elif self._current_filter == _FILTER_REVIEW:
-            self._table.setRowHidden(row, item.status != DedupStatus.REVIEW)
-        elif self._current_filter == _FILTER_NEW:
-            self._table.setRowHidden(row, item.status != DedupStatus.NEW or bool(item.error))
-        elif self._current_filter == _FILTER_ERROR:
-            self._table.setRowHidden(row, not item.error)
+        self._proxy.set_filter(filter_id)
 
     def _update_summary(self) -> None:
-        total = len(self._scan_results)
-        n_dup = sum(1 for r in self._scan_results if r.status == DedupStatus.DUPLICATE)
-        n_review = sum(1 for r in self._scan_results if r.status == DedupStatus.REVIEW)
-        n_new = sum(1 for r in self._scan_results
+        items = self._scan_results
+        total = len(items)
+        n_dup = sum(1 for r in items if r.status == DedupStatus.DUPLICATE)
+        n_review = sum(1 for r in items if r.status == DedupStatus.REVIEW)
+        n_new = sum(1 for r in items
                     if r.status == DedupStatus.NEW and not r.error)
-        n_err = sum(1 for r in self._scan_results if r.error)
+        n_err = sum(1 for r in items if r.error)
         self._summary_label.setText(
             f"共 {total} | 重复 {n_dup} | 待审 {n_review} | 新 {n_new} | 错 {n_err}"
         )
@@ -678,19 +876,28 @@ class DedupTab(QWidget):
     # ── 查看产品图片 ─────────────────────────────────────────────
 
     @Slot()
-    def _on_table_double_click(self, index) -> None:
-        self._show_product_images(index.row())
+    def _on_table_double_click(self, index: QModelIndex) -> None:
+        source_index = self._proxy.mapToSource(index)
+        self._show_product_images(source_index.row())
 
     @Slot()
     def _on_table_context_menu(self, pos) -> None:
-        row = self._table.rowAt(pos.y())
-        if row < 0 or row >= len(self._scan_results):
+        index = self._table.indexAt(pos)
+        if not index.isValid():
+            return
+        source_row = self._proxy.mapToSource(index).row()
+        if source_row < 0 or source_row >= len(self._scan_results):
             return
         menu = QMenu(self)
         act_view = QAction("查看图片", self)
-        act_view.triggered.connect(lambda: self._show_product_images(row))
+        act_view.triggered.connect(lambda: self._show_product_images(source_row))
         menu.addAction(act_view)
-        menu.exec(self._table.viewport().mapToGlobal(pos))
+
+        act_split = QAction("自定义拆分", self)
+        act_split.triggered.connect(lambda: self._on_custom_split(source_row))
+        menu.addAction(act_split)
+
+        menu.exec(self._table.mapToGlobal(pos))
 
     def _show_product_images(self, row: int) -> None:
         if row < 0 or row >= len(self._scan_results):
@@ -701,6 +908,31 @@ class DedupTab(QWidget):
             return
         dlg = ProductImageDialog(item.folder, parent=self)
         dlg.exec()
+
+    def _on_custom_split(self, row: int) -> None:
+        """自定义拆分功能：打开拆分对话框对相册进行手动拆分"""
+        if row < 0 or row >= len(self._scan_results):
+            return
+        original_item = self._scan_results[row]
+        if not original_item.folder.exists():
+            QMessageBox.warning(self, "文件夹不存在", f"文件夹已被删除:\n{original_item.folder}")
+            return
+
+        from .split_dialog import SplitDialog
+        from ..config import CLUSTER_THRESHOLD_DEFAULT
+
+        dlg = SplitDialog(
+            original_item.folder,
+            threshold=CLUSTER_THRESHOLD_DEFAULT,
+            parent=self,
+        )
+        result = dlg.exec()
+
+        if result == SplitDialog.DialogCode.Accepted:
+            # 拆分完成后，从扫描结果中移除该行
+            self._model.remove_item(row)
+            self._update_summary()
+            self.status_message.emit(f"已拆分: {original_item.name}")
 
     # ── 审核 ───────────────────────────────────────────────────
 
@@ -726,6 +958,15 @@ class DedupTab(QWidget):
 
     def _delete_folder_and_mark(self, row: int, folder: Path, label: str) -> None:
         """删除文件夹并更新表格行状态。"""
+        # 安全校验：确保路径在下载目录内，防止误删
+        try:
+            folder.resolve().relative_to(self._download_dir.resolve())
+        except ValueError:
+            QMessageBox.critical(
+                self, "安全限制",
+                f"拒绝删除下载目录以外的文件夹:\n{folder}",
+            )
+            return
         ret = QMessageBox.question(
             self, "确认删除",
             f"确定要删除文件夹及其所有图片吗？\n\n{folder}\n\n此操作不可撤销。",
@@ -740,15 +981,7 @@ class DedupTab(QWidget):
             self._progress.set_status(f"删除失败: {e}")
             return
 
-        status_cell = self._table.item(row, 0)
-        status_cell.setText(label)
-        status_cell.setForeground(Qt.GlobalColor.gray)
-        status_cell.setBackground(_COLOR_ERROR)
-
-        lbl = QLabel(label)
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet("color: gray;")
-        self._table.setCellWidget(row, 5, lbl)
+        self._model.mark_deleted(row, label)
         self._update_summary()
         self.status_message.emit(f"{label}: {self._scan_results[row].name}")
 
@@ -774,12 +1007,18 @@ class DedupTab(QWidget):
         # 1. 从 DB + FAISS 移除已有产品
         dedup.remove_product(existing.id)
 
-        # 2. 删除已有产品的文件夹
+        # 2. 删除已有产品的文件夹（校验路径安全性）
         try:
-            if exist_folder.exists():
-                shutil.rmtree(exist_folder)
-        except OSError as e:
-            self._progress.set_status(f"删除旧文件夹失败: {e}")
+            exist_folder.resolve().relative_to(self._download_dir.resolve())
+        except ValueError:
+            self._progress.set_status(f"安全限制: 拒绝删除下载目录外的文件夹")
+            logger.warning("拒绝删除下载目录外的文件夹: %s", exist_folder)
+        else:
+            try:
+                if exist_folder.exists():
+                    shutil.rmtree(exist_folder)
+            except OSError as e:
+                self._progress.set_status(f"删除旧文件夹失败: {e}")
 
         # 3. 注册新产品入库
         self._register_single(row)
@@ -806,22 +1045,7 @@ class DedupTab(QWidget):
             embedding=item.embedding,
         )
 
-        # 更新行显示
-        self._scan_results[row] = DedupScanItem(
-            folder=item.folder, name=item.name, image_count=item.image_count,
-            status=DedupStatus.NEW, best_match=item.best_match,
-            all_matches=item.all_matches, embedding=item.embedding, error=None,
-        )
-
-        status_cell = self._table.item(row, 0)
-        status_cell.setText("已入库")
-        status_cell.setForeground(Qt.GlobalColor.darkGreen)
-
-        lbl = QLabel("已入库")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet("color: green;")
-        self._table.setCellWidget(row, 5, lbl)
-
+        self._model.mark_registered(row)
         self._update_db_count()
         self._update_summary()
         self.status_message.emit(f"已入库: {item.name}")
@@ -831,9 +1055,15 @@ class DedupTab(QWidget):
     @Slot()
     def _on_register_all_new(self) -> None:
         """启动后台线程批量注册所有 NEW 状态的产品。"""
+        registered = self._model._registered_rows
+        deleted = self._model._deleted_rows
         new_items = [
-            item for item in self._scan_results
-            if item.status == DedupStatus.NEW and not item.error and item.embedding is not None
+            item for row, item in enumerate(self._scan_results)
+            if item.status == DedupStatus.NEW
+            and not item.error
+            and item.embedding is not None
+            and row not in registered
+            and row not in deleted
         ]
         if not new_items:
             self._progress.set_status("没有需要入库的新产品")
@@ -844,7 +1074,6 @@ class DedupTab(QWidget):
             return
         self._btn_register_all.setEnabled(False)
         self._btn_scan.setEnabled(False)
-        # 禁用表格中的审核按钮，防止并发访问 Deduplicator
         self._table.setEnabled(False)
         self._progress.set_status(f"正在注册 {len(new_items)} 个新产品...")
 
@@ -867,19 +1096,7 @@ class DedupTab(QWidget):
         self.status_message.emit(f"批量入库完成: {count} 个产品")
         self._register_worker = None
 
-        # 更新所有 NEW 行的状态为"已入库"
-        for row, item in enumerate(self._scan_results):
-            if item.status == DedupStatus.NEW and not item.error and item.embedding is not None:
-                status_cell = self._table.item(row, 0)
-                if status_cell and status_cell.text() == "新":
-                    status_cell.setText("已入库")
-                    status_cell.setForeground(Qt.GlobalColor.darkGreen)
-
-                    lbl = QLabel("已入库")
-                    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    lbl.setStyleSheet("color: green;")
-                    self._table.setCellWidget(row, 5, lbl)
-
+        self._model.mark_all_new_registered()
         self._update_db_count()
 
     @Slot(str)
@@ -903,6 +1120,9 @@ class DedupTab(QWidget):
         if self._register_worker and self._register_worker.isRunning():
             self._register_worker.cancel()
             self._register_worker.wait(3000)
+        if self._folder_scan_worker and self._folder_scan_worker.isRunning():
+            self._folder_scan_worker.cancel()
+            self._folder_scan_worker.wait(3000)
         if self._deduplicator:
             self._deduplicator.close()
             self._deduplicator = None

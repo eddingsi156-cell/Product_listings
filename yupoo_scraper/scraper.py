@@ -91,6 +91,8 @@ def _parse_albums_page(html: str, base_url: str) -> list[Album]:
         if not album_id:
             id_match = re.search(r"/albums/(\d+)", href)
             album_id = id_match.group(1) if id_match else ""
+        if not album_id:
+            logger.warning("无法提取相册 ID，跳过: href=%s", href)
 
         # 标题：优先用 title 属性，其次用子元素文本
         title = a_tag.get("title", "").strip()
@@ -276,21 +278,34 @@ async def get_album_list(
     if on_progress:
         on_progress(1, max_page)
 
-    # 后续页
-    for page_num in range(2, max_page + 1):
-        # 页面间延迟，避免触发 429
-        await asyncio.sleep(random.uniform(*config.REQUEST_DELAY))
+    # 后续页 — 分批并发获取（PAGE_CONCURRENCY 页/批）
+    remaining_pages = list(range(2, max_page + 1))
+    batch_size = config.PAGE_CONCURRENCY
 
-        page_url = f"{base_url}/categories?page={page_num}"
-        html = await _fetch_with_retry(session, page_url, headers)
+    for batch_start in range(0, len(remaining_pages), batch_size):
+        batch = remaining_pages[batch_start:batch_start + batch_size]
 
-        for album in _parse_albums_page(html, base_url):
-            if album.album_id and album.album_id not in seen_ids:
-                seen_ids.add(album.album_id)
-                all_albums.append(album)
+        # 批次间延迟，补偿并发突发
+        if batch_start > 0:
+            await asyncio.sleep(random.uniform(*config.PAGE_BATCH_DELAY))
 
-        if on_progress:
-            on_progress(page_num, max_page)
+        # 并发获取本批次所有页面
+        async def _fetch_page(page_num: int) -> tuple[int, str]:
+            url = f"{base_url}/categories?page={page_num}"
+            html = await _fetch_with_retry(session, url, headers)
+            return page_num, html
+
+        results = await asyncio.gather(*[_fetch_page(p) for p in batch])
+
+        # 按页码顺序处理，保持确定性排序
+        for page_num, html in sorted(results, key=lambda r: r[0]):
+            for album in _parse_albums_page(html, base_url):
+                if album.album_id and album.album_id not in seen_ids:
+                    seen_ids.add(album.album_id)
+                    all_albums.append(album)
+
+            if on_progress:
+                on_progress(page_num, max_page)
 
     return all_albums
 

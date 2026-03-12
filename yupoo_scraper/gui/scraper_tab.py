@@ -46,6 +46,14 @@ from ..scraper import (
 from .widgets import StatusProgressBar
 
 
+def _create_connector() -> aiohttp.TCPConnector:
+    """创建带连接数限制的 TCP 连接器。"""
+    return aiohttp.TCPConnector(
+        limit=config.HTTP_CONN_LIMIT,
+        limit_per_host=config.HTTP_CONN_LIMIT_PER_HOST,
+    )
+
+
 class ScraperTab(QWidget):
     """采集标签页"""
 
@@ -319,7 +327,7 @@ class ScraperTab(QWidget):
     async def _fetch_categories_async(self) -> None:
         """获取分类列表并填充 ComboBox，然后自动加载第一个分类的相册。"""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=_create_connector()) as session:
                 self._progress.set_status("正在获取分类列表 ...")
                 self._categories = await get_categories(session, self._username)
 
@@ -369,7 +377,7 @@ class ScraperTab(QWidget):
             category_id = self._category_combo.currentData()
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=_create_connector()) as session:
                 if category_id is not None:
                     self._progress.set_status("正在加载分类相册 ...")
                     self._albums = await get_category_albums(
@@ -547,7 +555,7 @@ class ScraperTab(QWidget):
                     logger.debug("封面下载失败 row=%d: %s", row, e)
                     return row, None
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=_create_connector()) as session:
             tasks = [
                 _fetch_cover_hash(session, row, url)
                 for row, url in cover_tasks
@@ -631,7 +639,7 @@ class ScraperTab(QWidget):
             total_images = 0
             downloaded_images = 0
 
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=_create_connector()) as session:
 
                 async def producer():
                     nonlocal scanned_albums, total_images
@@ -784,6 +792,14 @@ class ScraperTab(QWidget):
             self._log("正在停止 ...")
         if self._download_task and not self._download_task.done():
             self._download_task.cancel()
+        # 如果 5 秒后仍未停止，提示用户
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(5000, self._check_stop_timeout)
+
+    def _check_stop_timeout(self) -> None:
+        """检查停止操作是否超时。"""
+        if self._download_task and not self._download_task.done():
+            self._progress.set_status("停止超时，请稍候或重启应用")
 
     def cleanup(self) -> None:
         """应用关闭时调用，取消进行中的下载和获取。"""

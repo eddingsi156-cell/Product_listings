@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -11,10 +12,11 @@ from urllib.request import urlopen
 
 from .config import CHROME_USER_DATA_DIR, WEIDIAN_CDP_PORT
 
-# Windows 上 Chrome 的常见安装路径
 _CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(r"%USERPROFILE%\AppData\Local\Google\Chrome\Application\chrome.exe"),
 ]
 
 
@@ -44,7 +46,7 @@ def is_cdp_available(port: int = WEIDIAN_CDP_PORT, timeout: float = 2.0) -> bool
 def launch_chrome(
     port: int = WEIDIAN_CDP_PORT,
     user_data_dir: Path | None = None,
-    timeout: float = 10.0,
+    timeout: float = 30.0,
 ) -> subprocess.Popen | None:
     """启动 Chrome 并开启远程调试端口。
 
@@ -65,18 +67,25 @@ def launch_chrome(
     user_data_dir.mkdir(parents=True, exist_ok=True)
 
     args = [
-        chrome_path,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--new-window",
+        "--disable-popup-blocking",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
     ]
 
-    proc = subprocess.Popen(
-        args,
+    args_str = ", ".join(f'"{arg}"' for arg in args)
+    subprocess.run(
+        f'powershell -Command "Start-Process -FilePath \\"{chrome_path}\\" -ArgumentList {args_str}"',
+        shell=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+    proc = None
 
     # 等 CDP 端口就绪
     try:
@@ -88,12 +97,20 @@ def launch_chrome(
     except BaseException:
         # 异常时（包括 KeyboardInterrupt）确保 Chrome 进程被清理
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
         raise
 
     # 超时
     proc.terminate()
-    proc.wait(timeout=5)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
     raise TimeoutError(
         f"Chrome 启动超时（{timeout}秒）。请手动启动：\n"
         f'"{chrome_path}" --remote-debugging-port={port}'

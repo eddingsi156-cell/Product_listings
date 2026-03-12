@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -37,6 +38,14 @@ MAX_RETRIES = 5              # 失败重试次数 (含 429 重试)
 RETRY_BACKOFF = 2            # 指数退避基数
 REQUEST_TIMEOUT = 30         # 单次请求超时 (秒)
 
+# ── HTTP 连接池 ────────────────────────────────────────────────
+HTTP_CONN_LIMIT = 20         # 全局最大连接数
+HTTP_CONN_LIMIT_PER_HOST = 10 # 单主机最大连接数
+
+# ── 翻页并发（500K 相册优化）─────────────────────────────────
+PAGE_CONCURRENCY = 5         # 同时获取的页数（不超过单主机连接数）
+PAGE_BATCH_DELAY = (1.5, 3.0)  # 页面批次间延迟（秒），补偿并发突发
+
 
 def retry_wait(attempt: int, resp_headers: dict | None = None) -> float:
     """计算重试等待时间（秒），优先使用 Retry-After 头。"""
@@ -54,11 +63,17 @@ IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
 # ── 图片尺寸 ───────────────────────────────────────────────────
 IMAGE_SIZE = "big"           # big ≈ 1080px，是最大的渲染尺寸
 
+# ── 基础目录（打包后用 exe 所在目录，开发时用项目根目录）───────
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
 # ── 保存路径 ───────────────────────────────────────────────────
-DEFAULT_DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "downloads"
+DEFAULT_DOWNLOAD_DIR = BASE_DIR / "downloads"
 
 # ── 用户数据 ───────────────────────────────────────────────────
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = BASE_DIR / "data"
 URL_HISTORY_FILE = DATA_DIR / "url_history.json"
 URL_HISTORY_MAX = 20  # 最多记住多少条 URL
 UPLOAD_MARKS_FILE = DATA_DIR / "upload_marks.json"
@@ -112,7 +127,26 @@ DEDUP_EMBEDDING_DIM = COMBINED_DIM  # 608（CLIP + HSV，区分不同颜色）
 DEDUP_THRESHOLD_AUTO = 0.92      # >= 自动标记重复
 DEDUP_THRESHOLD_REVIEW = 0.85    # >= 待审核
 DEDUP_SEARCH_K = 5               # FAISS 返回 Top-K
-DEDUP_BATCH_SIZE = 32            # CLIP 推理批次
+DEDUP_BATCH_SIZE = 32            # CLIP 推理批次（默认，实际由设备决定）
+
+if DEDUP_THRESHOLD_REVIEW >= DEDUP_THRESHOLD_AUTO:
+    raise ValueError(
+        f"REVIEW 阈值({DEDUP_THRESHOLD_REVIEW}) 必须小于 AUTO 阈值({DEDUP_THRESHOLD_AUTO})"
+    )
+
+# CLIP 推理批大小（按设备区分）
+CLIP_BATCH_SIZE_GPU = 64         # GPU 批大小
+CLIP_BATCH_SIZE_CPU = 16         # CPU 批大小
+
+# FAISS 索引策略
+FAISS_IVF_THRESHOLD = 5000      # 产品数 >= 此值时使用 IVFFlat（否则 FlatIP）
+FAISS_IVFPQ_THRESHOLD = 500000  # 产品数 >= 此值时使用 IVFPQ（极致压缩）
+FAISS_PQ_M = 32                 # PQ 子量化器数量（dim 必须能被 M 整除，608/32=19）
+FAISS_PQ_NBITS = 8              # PQ 每个子向量的编码位数
+FAISS_NPROBE = 16               # IVF 搜索时探测的聚类数（越大越精确但越慢）
+FAISS_REBUILD_RATIO = 0.2       # 累计新增 > 此比例时触发 IVF 重新训练
+FAISS_SAVE_INTERVAL = 1000      # 增量持久化间隔（每新增 N 条向量保存一次）
+REGISTER_BATCH_SIZE = 500       # 批量注册时每批产品数（DB + FAISS 批写入）
 
 # ── 相册去重 (采集阶段) ─────────────────────────────────────────
 COVER_PHASH_SIZE = 16            # pHash 精度 (16×16 → 256-bit)
@@ -135,12 +169,36 @@ THUMBNAIL_SIZE = 120  # 缩略图像素尺寸
 WEIDIAN_PUBLISH_URL = "https://d.weidian.com/weidian-pc/weidian-loader/#/pc-vue-item/item/edit"
 WEIDIAN_CDP_URL = "http://localhost:9222"
 WEIDIAN_CDP_PORT = 9222
+LOGIN_CHECK_URL = "https://d.weidian.com/weidian-pc/weidian-loader/"
 
 # Chrome 浏览器用户数据目录（保持登录状态）
 CHROME_USER_DATA_DIR = DATA_DIR / "chrome_profile"
 
+# 上架超时配置（毫秒）
+UPLOAD_STEP_TIMEOUT_MS = 30000           # 每步超时
+UPLOAD_IMAGE_POLL_INTERVAL_MS = 2000    # 图片上传轮询间隔
+UPLOAD_IMAGE_MIN_WAIT_PER_IMAGE = 5000  # 每张图片最小等待时间(毫秒)
+UPLOAD_IMAGE_MAX_WAIT_BASE = 60000       # 基础最大等待时间(毫秒)
+
+# 上架延迟配置（秒）- 防止反自动化检测
+UPLOAD_STEP_DELAY_MIN = 0.5              # 最小延迟（可设为0禁用）
+UPLOAD_STEP_DELAY_MAX = 1.5              # 最大延迟
+
+# 上架重试配置
+UPLOAD_RETRY_MAX = 3                     # 最大重试次数
+UPLOAD_RETRY_DELAY = 5                   # 重试间隔(秒)
+
+# 代理配置
+WEIDIAN_PROXY_URL = ""                   # 代理地址，如 "http://127.0.0.1:7890"
+
+# 日志配置
+LOG_FILE = DATA_DIR / "app.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024        # 单个日志文件最大 10MB
+LOG_BACKUP_COUNT = 5                    # 保留的旧日志文件数量
+LOG_LEVEL = "INFO"                      # 日志级别: DEBUG, INFO, WARNING, ERROR
+
 # 图片限制
-MAIN_IMAGE_MAX = 6                      # 主图最多张数
+MAIN_IMAGE_MAX = 5                      # 主图最多张数（微店限制15，计划取前5张）
 DETAIL_IMAGE_MAX = 100                  # 详情图最多张数
 
 # 标题生成词池
@@ -161,3 +219,9 @@ CATEGORY_PROMPTS = {
     "belt":    ("a photo of a belt",      "腰带"),
     "scarf":   ("a photo of a scarf",     "围巾"),
 }
+
+# ── 配置完整性校验 ────────────────────────────────────────────
+if DEDUP_EMBEDDING_DIM % FAISS_PQ_M != 0:
+    raise ValueError(
+        f"DEDUP_EMBEDDING_DIM({DEDUP_EMBEDDING_DIM}) 必须能被 FAISS_PQ_M({FAISS_PQ_M}) 整除"
+    )

@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-import shutil
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -30,13 +28,15 @@ from PySide6.QtWidgets import (
 
 from .. import config
 from ..chrome_launcher import is_cdp_available, launch_chrome
-from ..title_generator import ProductInfo, TitleGenerator
+from ..title_generator import ProductInfo, get_title_generator
 from ..uploader import UploadResult, WeidianUploader
 from .widgets import StatusProgressBar
 
 from ..config import IMAGE_EXTS
 from ..organizer import find_image_folders
 from .base_worker import BaseWorker
+
+MAX_AUTO_SELECT = 3000
 
 
 # ── Workers ──────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ class PreviewWorker(BaseWorker):
 
     def _run(self) -> None:
         self.status.emit("正在加载 CLIP 模型...")
-        gen = TitleGenerator()
+        gen = get_title_generator()
         products = gen.batch_generate(
             self._folders,
             price=self._price,
@@ -93,12 +93,35 @@ class UploadWorker(BaseWorker):
     step_update = Signal(str)             # 当前步骤描述
     product_done = Signal(int, object)    # (index, UploadResult)
     finished_ok = Signal(list)            # list[UploadResult]
+    ready_for_login = Signal()             # 浏览器已启动，等待用户登录确认
 
     def __init__(self, products: list[ProductInfo], cdp_url: str):
         super().__init__()
         self._products = products
         self._cdp_url = cdp_url
         self._chrome_proc = None
+        self._uploader = None
+        self._login_confirmed = False
+        self._paused = False
+        import threading
+        self._login_confirm_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+
+    def pause(self) -> None:
+        """暂停上架。"""
+        self._paused = True
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """继续上架。"""
+        self._paused = False
+        self._pause_event.set()
+
+    def confirm_login(self) -> None:
+        """由 GUI 调用，确认用户已登录。"""
+        self._login_confirmed = True
+        self._login_confirm_event.set()
 
     def cleanup_chrome(self) -> None:
         """清理由本 worker 启动的 Chrome 进程（线程安全）。"""
@@ -114,10 +137,7 @@ class UploadWorker(BaseWorker):
     def run(self) -> None:
         # UploadWorker 需要自己的事件循环（Playwright 是 async 的），
         # 因此覆盖 run() 而非使用基类的模板方法。
-        if sys.platform == "win32":
-            loop = asyncio.ProactorEventLoop()
-        else:
-            loop = asyncio.new_event_loop()
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             results = loop.run_until_complete(self._run_async())
@@ -129,7 +149,9 @@ class UploadWorker(BaseWorker):
             asyncio.set_event_loop(None)
 
     async def _run_async(self) -> list[UploadResult]:
-        uploader = WeidianUploader()
+        from ..uploader import WEIDIAN_PUBLISH_URL
+
+        self._uploader = WeidianUploader()
 
         # 自动启动 Chrome（如果未运行）
         self.step_update.emit("正在检查浏览器...")
@@ -142,9 +164,26 @@ class UploadWorker(BaseWorker):
 
         self.step_update.emit("正在连接浏览器...")
         try:
-            await uploader.connect(self._cdp_url)
+            await self._uploader.connect(self._cdp_url)
         except Exception as e:
             raise RuntimeError(f"浏览器连接失败: {e}") from e
+
+        # 跳转到微店发布页
+        self.step_update.emit("正在打开微店后台...")
+        try:
+            page = await self._uploader._context.new_page()
+            await page.goto(WEIDIAN_PUBLISH_URL, wait_until="domcontentloaded")
+            await page.close()
+        except Exception as e:
+            raise RuntimeError(f"打开微店后台失败: {e}") from e
+
+        # 通知 GUI 显示"确认登录"按钮
+        self.step_update.emit("请在浏览器中登录微店，登录后点击确认...")
+        self.ready_for_login.emit()
+
+        # 等待用户确认登录
+        self._login_confirm_event.wait()
+        self.step_update.emit("开始上架...")
 
         try:
             results: list[UploadResult] = []
@@ -158,10 +197,22 @@ class UploadWorker(BaseWorker):
                         self.product_done.emit(len(results) - 1, r)
                     break
 
+                while self._paused and not self._cancelled:
+                    self._pause_event.wait()
+                    if self._cancelled:
+                        break
+
+                if self._cancelled:
+                    for p in self._products[i:]:
+                        r = UploadResult(p.folder, False, "已取消", title=p.title)
+                        results.append(r)
+                        self.product_done.emit(len(results) - 1, r)
+                    break
+
                 self.step_update.emit(
                     f"({i + 1}/{total}) {product.title[:20]}..."
                 )
-                result = await uploader.upload_product(
+                result = await self._uploader.upload_product(
                     product,
                     on_step=lambda msg: self.step_update.emit(msg),
                 )
@@ -171,7 +222,7 @@ class UploadWorker(BaseWorker):
 
             return results
         finally:
-            await uploader.disconnect()
+            await self._uploader.disconnect()
 
 
 # ── UploaderTab ──────────────────────────────────────────────────
@@ -313,6 +364,14 @@ class UploaderTab(QWidget):
         btn_delete_sel.clicked.connect(self._on_delete_selected)
         sel_layout.addWidget(btn_clear_marks)
         sel_layout.addWidget(btn_delete_sel)
+        sel_layout.addSpacing(16)
+        sel_layout.addWidget(QLabel("上限:"))
+        self._max_select_spin = QSpinBox()
+        self._max_select_spin.setRange(1, 99999)
+        self._max_select_spin.setValue(MAX_AUTO_SELECT)
+        self._max_select_spin.setFixedWidth(80)
+        self._max_select_spin.setToolTip("自动勾选的最大产品数量")
+        sel_layout.addWidget(self._max_select_spin)
         sel_layout.addStretch()
         main_layout.addLayout(sel_layout)
 
@@ -329,10 +388,21 @@ class UploaderTab(QWidget):
         self._btn_upload.clicked.connect(self._on_upload)
         conn_layout.addWidget(self._btn_upload)
 
+        self._btn_pause = QPushButton("暂停")
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.clicked.connect(self._on_pause)
+        conn_layout.addWidget(self._btn_pause)
+
         self._btn_stop = QPushButton("停止")
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop)
         conn_layout.addWidget(self._btn_stop)
+
+        self._btn_confirm_login = QPushButton("确认登录")
+        self._btn_confirm_login.setEnabled(False)
+        self._btn_confirm_login.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        self._btn_confirm_login.clicked.connect(self._on_confirm_login)
+        conn_layout.addWidget(self._btn_confirm_login)
 
         conn_layout.addStretch()
         main_layout.addLayout(conn_layout)
@@ -426,7 +496,7 @@ class UploaderTab(QWidget):
                 price=p_price,
                 stock=stock,
                 main_images=images[:config.MAIN_IMAGE_MAX],
-                detail_images=images[config.MAIN_IMAGE_MAX:],
+                detail_images=images[config.MAIN_IMAGE_MAX:][:config.DETAIL_IMAGE_MAX],
             ))
 
         self._populate_product_table()
@@ -441,10 +511,20 @@ class UploaderTab(QWidget):
 
     @Slot()
     def _on_select_all(self) -> None:
+        max_select = self._max_select_spin.value()
+        checked_count = 0
         for row in range(self._product_table.rowCount()):
             item = self._product_table.item(row, 1)
             if item:
-                item.setCheckState(Qt.CheckState.Checked)
+                if checked_count < max_select:
+                    item.setCheckState(Qt.CheckState.Checked)
+                    checked_count += 1
+                else:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+        if self._product_table.rowCount() > max_select:
+            self._progress.set_status(
+                f"已勾选 {checked_count} 个产品（最多 {max_select} 个）"
+            )
 
     @Slot()
     def _on_deselect_all(self) -> None:
@@ -456,13 +536,26 @@ class UploaderTab(QWidget):
     @Slot()
     def _on_select_not_uploaded(self) -> None:
         """勾选所有未上架的产品，取消勾选已上架的。"""
+        unchecked_count = 0
+        checked_count = 0
+        max_select = self._max_select_spin.value()
         for row in range(self._product_table.rowCount()):
             chk = self._product_table.item(row, 1)
             if chk and row < len(self._products):
                 uploaded = self._is_uploaded(self._products[row].folder)
-                chk.setCheckState(
-                    Qt.CheckState.Unchecked if uploaded else Qt.CheckState.Checked
-                )
+                if uploaded:
+                    chk.setCheckState(Qt.CheckState.Unchecked)
+                    unchecked_count += 1
+                else:
+                    if checked_count < max_select:
+                        chk.setCheckState(Qt.CheckState.Checked)
+                        checked_count += 1
+                    else:
+                        chk.setCheckState(Qt.CheckState.Unchecked)
+        if unchecked_count + checked_count > max_select:
+            self._progress.set_status(
+                f"已勾选 {checked_count} 个未上架产品（最多 {max_select} 个）"
+            )
 
     @Slot()
     def _on_select_uploaded(self) -> None:
@@ -509,7 +602,8 @@ class UploaderTab(QWidget):
 
         # 取消之前正在运行的预览 worker（防止并发覆盖）
         if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.wait(3000)
+            self._preview_worker.cancel()
+            self._preview_worker.wait(5000)
 
         self._btn_preview.setEnabled(False)
         self._progress.set_status("正在生成预览...")
@@ -553,61 +647,65 @@ class UploaderTab(QWidget):
         self._preview_worker = None
 
     def _populate_product_table(self) -> None:
-        """用 ProductInfo 列表填充产品表格。"""
-        self._product_table.setRowCount(0)
-        self._product_table.setRowCount(len(self._products))
+        """用 ProductInfo 列表填充产品表格（优化批量更新）。"""
+        self._product_table.setUpdatesEnabled(False)
+        try:
+            self._product_table.setRowCount(0)
+            self._product_table.setRowCount(len(self._products))
 
-        for row, p in enumerate(self._products):
-            # 序号
-            idx_item = QTableWidgetItem(str(row + 1))
-            idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self._product_table.setItem(row, 0, idx_item)
+            for row, p in enumerate(self._products):
+                # 序号
+                idx_item = QTableWidgetItem(str(row + 1))
+                idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._product_table.setItem(row, 0, idx_item)
 
-            # 勾选框
-            chk = QTableWidgetItem()
-            chk.setCheckState(Qt.CheckState.Checked)
-            chk.setFlags(
-                Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
-            )
-            self._product_table.setItem(row, 1, chk)
+                # 勾选框
+                chk = QTableWidgetItem()
+                chk.setCheckState(Qt.CheckState.Checked)
+                chk.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                )
+                self._product_table.setItem(row, 1, chk)
 
-            # 标题（可编辑）
-            title_item = QTableWidgetItem(p.title)
-            self._product_table.setItem(row, 2, title_item)
+                # 标题（可编辑）
+                title_item = QTableWidgetItem(p.title)
+                self._product_table.setItem(row, 2, title_item)
 
-            # 价格（可编辑）
-            price_item = QTableWidgetItem(f"{p.price:.2f}")
-            price_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._product_table.setItem(row, 3, price_item)
+                # 价格（可编辑）
+                price_item = QTableWidgetItem(f"{p.price:.2f}")
+                price_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._product_table.setItem(row, 3, price_item)
 
-            # 主图数
-            main_item = QTableWidgetItem(str(len(p.main_images)))
-            main_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            main_item.setFlags(
-                main_item.flags() & ~Qt.ItemFlag.ItemIsEditable
-            )
-            self._product_table.setItem(row, 4, main_item)
+                # 主图数
+                main_item = QTableWidgetItem(str(len(p.main_images)))
+                main_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                main_item.setFlags(
+                    main_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                )
+                self._product_table.setItem(row, 4, main_item)
 
-            # 详情图数
-            detail_item = QTableWidgetItem(str(len(p.detail_images)))
-            detail_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            detail_item.setFlags(
-                detail_item.flags() & ~Qt.ItemFlag.ItemIsEditable
-            )
-            self._product_table.setItem(row, 5, detail_item)
+                # 详情图数
+                detail_item = QTableWidgetItem(str(len(p.detail_images)))
+                detail_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                detail_item.setFlags(
+                    detail_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                )
+                self._product_table.setItem(row, 5, detail_item)
 
-            # 状态列
-            status_item = QTableWidgetItem()
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setFlags(
-                status_item.flags() & ~Qt.ItemFlag.ItemIsEditable
-            )
-            if self._is_uploaded(p.folder):
-                status_item.setText("已上架")
-                status_item.setForeground(Qt.GlobalColor.darkGreen)
-                chk.setCheckState(Qt.CheckState.Unchecked)
-            self._product_table.setItem(row, 6, status_item)
+                # 状态列
+                status_item = QTableWidgetItem()
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                status_item.setFlags(
+                    status_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                )
+                if self._is_uploaded(p.folder):
+                    status_item.setText("已上架")
+                    status_item.setForeground(Qt.GlobalColor.darkGreen)
+                    chk.setCheckState(Qt.CheckState.Unchecked)
+                self._product_table.setItem(row, 6, status_item)
+        finally:
+            self._product_table.setUpdatesEnabled(True)
 
     # ── 上架控制 ────────────────────────────────────────────────────
 
@@ -628,13 +726,19 @@ class UploaderTab(QWidget):
         warnings = self._sync_table_to_products()
         if warnings:
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(
+            reply = QMessageBox.warning(
                 self, "价格数据异常",
-                "以下行存在问题：\n" + "\n".join(warnings),
+                "以下行存在问题：\n" + "\n".join(warnings) + "\n\n是否继续上架？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         self._btn_upload.setEnabled(False)
         self._btn_stop.setEnabled(True)
+        self._btn_pause.setEnabled(True)
+        self._btn_pause.setText("暂停")
         self._btn_preview.setEnabled(False)
         self._result_table.setRowCount(0)
         self._progress.reset()
@@ -646,21 +750,53 @@ class UploaderTab(QWidget):
         self._upload_worker.product_done.connect(self._on_product_done)
         self._upload_worker.finished_ok.connect(self._on_upload_done)
         self._upload_worker.finished_err.connect(self._on_upload_error)
+        self._upload_worker.ready_for_login.connect(self._on_ready_for_login)
         self._upload_worker.start()
 
     @Slot(str)
     def _on_upload_status(self, msg: str) -> None:
         self._progress.set_status(msg)
 
+    @Slot()
+    def _on_ready_for_login(self) -> None:
+        self._btn_confirm_login.setEnabled(True)
+        self._btn_upload.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._btn_pause.setEnabled(True)
+        self._btn_pause.setText("暂停")
+        self.status_message.emit("请在浏览器中登录微店，登录后点击「确认登录」按钮")
+
+    @Slot()
+    def _on_confirm_login(self) -> None:
+        if self._upload_worker:
+            self._upload_worker.confirm_login()
+        self._btn_confirm_login.setEnabled(False)
+        self._btn_stop.setEnabled(False)
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.setText("暂停")
+
     @Slot(int, int)
     def _on_upload_progress(self, current: int, total: int) -> None:
         self._progress.set_progress(current, total)
+
+    @Slot()
+    def _on_pause(self) -> None:
+        if self._upload_worker:
+            if self._btn_pause.text() == "暂停":
+                self._upload_worker.pause()
+                self._btn_pause.setText("继续")
+                self._progress.set_status("已暂停...")
+            else:
+                self._upload_worker.resume()
+                self._btn_pause.setText("暂停")
+                self._progress.set_status("继续上传...")
 
     @Slot()
     def _on_stop(self) -> None:
         if self._upload_worker:
             self._upload_worker.cancel()
             self._btn_stop.setEnabled(False)
+            self._btn_pause.setEnabled(False)
             self._progress.set_status("正在停止...")
 
     @Slot(int, object)
@@ -686,10 +822,18 @@ class UploaderTab(QWidget):
         self._result_table.setItem(row, 1, name_item)
 
         # 备注
-        note = result.error or "上架成功"
-        note_item = QTableWidgetItem(note)
         if result.error:
+            note = result.error
+            note_item = QTableWidgetItem(note)
             note_item.setForeground(Qt.GlobalColor.red)
+        elif result.warning:
+            note = result.warning
+            note_item = QTableWidgetItem(note)
+            note_item.setForeground(Qt.GlobalColor.darkYellow)
+        else:
+            note = "上架成功"
+            note_item = QTableWidgetItem(note)
+            note_item.setForeground(Qt.GlobalColor.darkGreen)
         self._result_table.setItem(row, 2, note_item)
 
         # 上架成功 → 标记并更新产品表格
@@ -708,7 +852,10 @@ class UploaderTab(QWidget):
         self._cleanup_chrome_proc()
         self._btn_upload.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.setText("暂停")
         self._btn_preview.setEnabled(True)
+        self._btn_confirm_login.setEnabled(False)
         ok = sum(1 for r in results if r.success)
         fail = len(results) - ok
         msg = f"上架完成: {ok} 成功, {fail} 失败"
@@ -722,7 +869,10 @@ class UploaderTab(QWidget):
         self._cleanup_chrome_proc()
         self._btn_upload.setEnabled(True)
         self._btn_stop.setEnabled(False)
+        self._btn_pause.setEnabled(False)
+        self._btn_pause.setText("暂停")
         self._btn_preview.setEnabled(True)
+        self._btn_confirm_login.setEnabled(False)
         self._progress.set_status(f"上架出错: {error}")
         self.status_message.emit(f"上架出错: {error}")
         self._upload_worker = None
@@ -732,6 +882,9 @@ class UploaderTab(QWidget):
     def _sync_table_to_products(self) -> list[str]:
         """将表格中用户编辑的标题/价格同步回 ProductInfo。
 
+        只对勾选（将上架）的行进行数据校验并产生警告。
+        未勾选的行仍同步数据，但不校验。
+
         Returns:
             包含无效价格警告信息的列表（空列表 = 全部有效）。
         """
@@ -739,20 +892,26 @@ class UploaderTab(QWidget):
         for row in range(self._product_table.rowCount()):
             if row >= len(self._products):
                 break
+            chk = self._product_table.item(row, 1)
+            is_selected = chk and chk.checkState() == Qt.CheckState.Checked
             title_item = self._product_table.item(row, 2)
             if title_item:
-                self._products[row].title = title_item.text()
+                title_text = title_item.text().strip()
+                if is_selected and not title_text:
+                    warnings.append(f"第 {row + 1} 行标题为空")
+                self._products[row].title = title_text
             price_item = self._product_table.item(row, 3)
             if price_item:
                 try:
                     price = float(price_item.text())
-                    if price <= 0:
+                    if is_selected and price <= 0:
                         warnings.append(f"第 {row + 1} 行价格 <= 0")
                     self._products[row].price = price
                 except ValueError:
-                    warnings.append(
-                        f"第 {row + 1} 行价格无效: {price_item.text()!r}"
-                    )
+                    if is_selected:
+                        warnings.append(
+                            f"第 {row + 1} 行价格无效: {price_item.text()!r}"
+                        )
         return warnings
 
     def _get_selected_products(self) -> list[ProductInfo]:
@@ -868,12 +1027,14 @@ class UploaderTab(QWidget):
 
         reply = QMessageBox.warning(
             self, "确认删除",
-            f"即将永久删除 {len(selected_rows)} 个产品文件夹，此操作不可撤销！\n\n继续？",
+            f"即将删除 {len(selected_rows)} 个产品文件夹到回收站。\n\n继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        from send2trash import send2trash
 
         deleted = 0
         errors: list[str] = []
@@ -881,7 +1042,7 @@ class UploaderTab(QWidget):
         for row in reversed(selected_rows):
             folder = self._products[row].folder
             try:
-                shutil.rmtree(folder)
+                send2trash(str(folder))
                 self._unmark_uploaded(folder)
                 self._products.pop(row)
                 deleted += 1
@@ -902,10 +1063,13 @@ class UploaderTab(QWidget):
     def cleanup(self) -> None:
         """安全停止后台线程。"""
         if self._preview_worker and self._preview_worker.isRunning():
-            self._preview_worker.wait(3000)
+            self._preview_worker.cancel()
+            self._preview_worker.wait(5000)
         if self._upload_worker and self._upload_worker.isRunning():
             self._upload_worker.cancel()
             self._upload_worker.wait(5000)
+        # 无条件清理 Chrome 进程，防止关闭应用后进程残留
+        self._cleanup_chrome_proc()
 
     @staticmethod
     def _find_product_folders(base_dir: Path) -> list[Path]:

@@ -7,9 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import (
-    QByteArray,
     QEvent,
-    QMimeData,
     QPoint,
     QRect,
     QSize,
@@ -18,27 +16,20 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDrag, QImageReader, QKeyEvent, QMouseEvent, QPixmap, QShortcut, QKeySequence
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLayout,
-    QLayoutItem,
-    QLineEdit,
     QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QRubberBand,
     QScrollArea,
-    QSizePolicy,
     QSlider,
-    QStyle,
     QVBoxLayout,
     QWidget,
-    QWidgetItem,
 )
 
 from ..config import (
@@ -46,7 +37,6 @@ from ..config import (
     CLUSTER_THRESHOLD_MAX,
     CLUSTER_THRESHOLD_MIN,
     COMBINED_DIM,
-    THUMBNAIL_SIZE,
 )
 from ..ml.splitter import (
     SplitGroup,
@@ -56,299 +46,14 @@ from ..ml.splitter import (
     recluster,
 )
 
-# 自定义 MIME 类型
-MIME_IMAGE_PATH = "application/x-product-split-image"
-
-
-# ── FlowLayout ─────────────────────────────────────────────────
-
-class FlowLayout(QLayout):
-    """自动换行的流式布局（Qt 不内置此布局）。"""
-
-    def __init__(self, parent: QWidget | None = None, spacing: int = 4) -> None:
-        super().__init__(parent)
-        self._items: list[QLayoutItem] = []
-        self._spacing = spacing
-
-    def addItem(self, item: QLayoutItem) -> None:
-        self._items.append(item)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def itemAt(self, index: int) -> QLayoutItem | None:
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    def takeAt(self, index: int) -> QLayoutItem | None:
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
-
-    def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, width: int) -> int:
-        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
-
-    def setGeometry(self, rect: QRect) -> None:
-        super().setGeometry(rect)
-        self._do_layout(rect, test_only=False)
-
-    def sizeHint(self) -> QSize:
-        return self.minimumSize()
-
-    def minimumSize(self) -> QSize:
-        size = QSize()
-        for item in self._items:
-            size = size.expandedTo(item.minimumSize())
-        m = self.contentsMargins()
-        size += QSize(m.left() + m.right(), m.top() + m.bottom())
-        return size
-
-    def _do_layout(self, rect: QRect, test_only: bool) -> int:
-        m = self.contentsMargins()
-        effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
-        x = effective.x()
-        y = effective.y()
-        line_height = 0
-
-        for item in self._items:
-            sz = item.sizeHint()
-            next_x = x + sz.width() + self._spacing
-            if next_x - self._spacing > effective.right() and line_height > 0:
-                x = effective.x()
-                y += line_height + self._spacing
-                next_x = x + sz.width() + self._spacing
-                line_height = 0
-
-            if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), sz))
-
-            x = next_x
-            line_height = max(line_height, sz.height())
-
-        return y + line_height - rect.y() + m.bottom()
-
-
-# ── ThumbnailWidget ────────────────────────────────────────────
-
-class ThumbnailWidget(QLabel):
-    """可拖拽的缩略图标签，支持选中状态。"""
-
-    clicked = Signal(object, object)  # (self, QMouseEvent)
-    drag_started = Signal(object)  # (self,)
-
-    _STYLE_NORMAL = "border: 1px solid #ccc; background: white; padding: 2px;"
-    _STYLE_SELECTED = "border: 3px solid #3daee9; background: #d4edfc; padding: 0px;"
-
-    def __init__(self, image_path: Path, thumb_size: int = THUMBNAIL_SIZE) -> None:
-        super().__init__()
-        self.image_path = image_path
-        self._thumb_size = thumb_size
-        self._selected = False
-
-        reader = QImageReader(str(image_path))
-        reader.setAutoTransform(True)
-        orig_size = reader.size()
-        if orig_size.isValid():
-            orig_size.scale(thumb_size, thumb_size, Qt.AspectRatioMode.KeepAspectRatio)
-            reader.setScaledSize(orig_size)
-        pixmap = QPixmap.fromImageReader(reader)
-        self.setPixmap(pixmap)
-        self.setFixedSize(thumb_size, thumb_size)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(self._STYLE_NORMAL)
-        self.setToolTip(image_path.name)
-
-        # 批量拖拽时由 SplitDialog 设置
-        self._batch_drag_paths: list[str] | None = None
-
-    @property
-    def selected(self) -> bool:
-        return self._selected
-
-    @selected.setter
-    def selected(self, value: bool) -> None:
-        if self._selected == value:
-            return
-        self._selected = value
-        self.setStyleSheet(self._STYLE_SELECTED if value else self._STYLE_NORMAL)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start = event.position().toPoint()
-            self.clicked.emit(self, event)
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if not (event.buttons() & Qt.MouseButton.LeftButton):
-            return
-        if not hasattr(self, "_drag_start"):
-            return
-        dist = (event.position().toPoint() - self._drag_start).manhattanLength()
-        if dist < QApplication_startDragDistance():
-            return
-
-        self.drag_started.emit(self)
-
-        drag = QDrag(self)
-        mime = QMimeData()
-
-        # 如果有批量路径（由 SplitDialog 在 drag_started 中设置），用换行分隔
-        if self._batch_drag_paths:
-            payload = "\n".join(self._batch_drag_paths)
-        else:
-            payload = str(self.image_path)
-
-        mime.setData(MIME_IMAGE_PATH, QByteArray(payload.encode("utf-8")))
-        drag.setMimeData(mime)
-
-        # 拖拽时显示缩略图
-        pm = self.pixmap()
-        if pm and not pm.isNull():
-            drag.setPixmap(pm.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio))
-        drag.exec(Qt.DropAction.MoveAction)
-
-        # 清除批量路径
-        self._batch_drag_paths = None
-
-    def contextMenuEvent(self, event) -> None:
-        # 委托给 SplitDialog 处理
-        dialog = self._find_split_dialog()
-        if dialog is not None:
-            dialog._on_thumb_context_menu(self, event.globalPos())
-            event.accept()
-        else:
-            super().contextMenuEvent(event)
-
-    def _find_split_dialog(self) -> "SplitDialog | None":
-        p = self.parent()
-        while p is not None:
-            if isinstance(p, SplitDialog):
-                return p
-            p = p.parent()
-        return None
-
-
-def QApplication_startDragDistance() -> int:
-    from PySide6.QtWidgets import QApplication
-    return QApplication.startDragDistance()
-
-
-# ── GroupWidget ────────────────────────────────────────────────
-
-class GroupWidget(QGroupBox):
-    """分组容器 — 接受 drop，包含名称编辑 + 缩略图网格。"""
-
-    image_dropped = Signal(str, int)  # (image_path_str, target_group_id)
-    thumbnail_added = Signal(object)  # (ThumbnailWidget,)
-
-    def __init__(self, group: SplitGroup, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.group_id = group.id
-        self.setAcceptDrops(True)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 8, 4, 4)
-
-        # 标题行：名称编辑 + 图片数量
-        header = QHBoxLayout()
-        self._name_edit = QLineEdit(group.name)
-        self._name_edit.setPlaceholderText("分组名称")
-        self._count_label = QLabel(f"({len(group.image_paths)} 张)")
-        header.addWidget(self._name_edit, 1)
-        header.addWidget(self._count_label)
-        layout.addLayout(header)
-
-        # 缩略图区域
-        self._flow_container = QWidget()
-        self._flow_layout = FlowLayout(self._flow_container, spacing=4)
-        layout.addWidget(self._flow_container)
-
-        # 添加缩略图
-        self._thumbnails: list[ThumbnailWidget] = []
-        for img_path in group.image_paths:
-            thumb = ThumbnailWidget(img_path)
-            self._flow_layout.addWidget(thumb)
-            self._thumbnails.append(thumb)
-
-        self.setStyleSheet(
-            "GroupWidget { border: 2px solid #3daee9; border-radius: 4px; "
-            "margin-top: 8px; } "
-            "GroupWidget::title { padding: 0 4px; }"
-        )
-
-    @property
-    def group_name(self) -> str:
-        return self._name_edit.text().strip()
-
-    @property
-    def image_paths(self) -> list[Path]:
-        return [t.image_path for t in self._thumbnails]
-
-    def thumbnails(self) -> list[ThumbnailWidget]:
-        return list(self._thumbnails)
-
-    def add_thumbnail(self, image_path: Path) -> ThumbnailWidget:
-        thumb = ThumbnailWidget(image_path)
-        self._flow_layout.addWidget(thumb)
-        self._thumbnails.append(thumb)
-        self._count_label.setText(f"({len(self._thumbnails)} 张)")
-        thumb.show()
-        self.thumbnail_added.emit(thumb)
-        return thumb
-
-    def remove_thumbnail(self, image_path: Path) -> bool:
-        for i, t in enumerate(self._thumbnails):
-            if t.image_path == image_path:
-                # 遍历 FlowLayout 找到对应 widget 的索引再移除
-                for idx in range(self._flow_layout.count()):
-                    item = self._flow_layout.itemAt(idx)
-                    if item and item.widget() is t:
-                        self._flow_layout.takeAt(idx)
-                        break
-                t.setParent(None)
-                t.deleteLater()
-                self._thumbnails.pop(i)
-                self._count_label.setText(f"({len(self._thumbnails)} 张)")
-                return True
-        return False
-
-    def remove_thumbnail_widget(self, thumb: ThumbnailWidget) -> bool:
-        """直接按 widget 引用移除。"""
-        if thumb not in self._thumbnails:
-            return False
-        for idx in range(self._flow_layout.count()):
-            item = self._flow_layout.itemAt(idx)
-            if item and item.widget() is thumb:
-                self._flow_layout.takeAt(idx)
-                break
-        self._thumbnails.remove(thumb)
-        thumb.setParent(None)
-        thumb.deleteLater()
-        self._count_label.setText(f"({len(self._thumbnails)} 张)")
-        return True
-
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasFormat(MIME_IMAGE_PATH):
-            event.acceptProposedAction()
-
-    def dropEvent(self, event) -> None:
-        data = event.mimeData().data(MIME_IMAGE_PATH)
-        payload = bytes(data).decode("utf-8")
-        # 支持多路径（换行分隔）
-        for path_str in payload.split("\n"):
-            path_str = path_str.strip()
-            if path_str:
-                self.image_dropped.emit(path_str, self.group_id)
-        event.acceptProposedAction()
+from .base_worker import BaseWorker
+from .flow_layout import FlowLayout
+from .group_widget import GroupWidget
+from .thumbnail_widget import ThumbnailWidget
 
 
 # ── 工作线程 ───────────────────────────────────────────────────
 
-from .base_worker import BaseWorker
 
 
 class SplitWorker(BaseWorker):
@@ -358,10 +63,11 @@ class SplitWorker(BaseWorker):
     progress = Signal(int, int)  # (current, total)
     finished_ok = Signal(object)  # SplitResult
 
-    def __init__(self, folder: Path, threshold: float) -> None:
+    def __init__(self, folder: Path, threshold: float, force: bool = False) -> None:
         super().__init__()
         self._folder = folder
         self._threshold = threshold
+        self._force = force
 
     def _run(self) -> None:
         result = extract_and_split(
@@ -373,6 +79,7 @@ class SplitWorker(BaseWorker):
             on_progress=lambda cur, tot: (
                 self.progress.emit(cur, tot) if not self._cancelled else None
             ),
+            force=self._force,
         )
         if not self._cancelled:
             self.finished_ok.emit(result)
@@ -394,6 +101,22 @@ class ApplyWorker(BaseWorker):
             on_progress=lambda cur, tot: self.progress.emit(cur, tot),
         )
         self.finished_ok.emit(folders)
+
+
+class ReclusterWorker(BaseWorker):
+    """后台执行重聚类（大数据集）。"""
+
+    finished_ok = Signal(object)
+
+    def __init__(self, result: SplitResult, threshold: float) -> None:
+        super().__init__()
+        self._result = result
+        self._threshold = threshold
+
+    def _run(self) -> None:
+        new_result = recluster(self._result, self._threshold)
+        if not self._cancelled:
+            self.finished_ok.emit(new_result)
 
 
 # ── SplitDialog ────────────────────────────────────────────────
@@ -418,6 +141,7 @@ class SplitDialog(QDialog):
         self._result: SplitResult | None = None
         self._worker: SplitWorker | None = None
         self._apply_worker: ApplyWorker | None = None
+        self._recluster_worker: BaseWorker | None = None
         self._group_widgets: list[GroupWidget] = []
         self._recluster_timer = QTimer(self)
         self._recluster_timer.setSingleShot(True)
@@ -456,7 +180,7 @@ class SplitDialog(QDialog):
 
         # ── 灵敏度滑块 ────────────────────────────────────────
         slider_layout = QHBoxLayout()
-        slider_layout.addWidget(QLabel("灵敏度（少分组 ← → 多分组）："))
+        slider_layout.addWidget(QLabel("灵敏度（多分组 ← → 少分组）："))
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setMinimum(int(CLUSTER_THRESHOLD_MIN * 100))
         self._slider.setMaximum(int(CLUSTER_THRESHOLD_MAX * 100))
@@ -533,31 +257,54 @@ class SplitDialog(QDialog):
 
     def _clear_selection(self) -> None:
         for t in self._selected_thumbs:
-            t.selected = False
+            # 检查 widget 是否仍然有效（C++ 对象未被删除）
+            if t and hasattr(t, 'parent') and t.parent() is not None:
+                try:
+                    t.selected = False
+                except RuntimeError:
+                    pass
         self._selected_thumbs.clear()
         self._update_selection_label()
 
     def _set_selection(self, thumbs: list[ThumbnailWidget]) -> None:
         self._clear_selection()
         for t in thumbs:
-            t.selected = True
-            self._selected_thumbs.append(t)
+            # 检查 widget 是否仍然有效
+            if t and hasattr(t, 'parent') and t.parent() is not None:
+                try:
+                    t.selected = True
+                    self._selected_thumbs.append(t)
+                except RuntimeError:
+                    # 忽略已删除的 widget
+                    pass
         self._update_selection_label()
 
     def _toggle_selection(self, thumb: ThumbnailWidget) -> None:
-        if thumb in self._selected_thumbs:
-            thumb.selected = False
-            self._selected_thumbs.remove(thumb)
-        else:
-            thumb.selected = True
-            self._selected_thumbs.append(thumb)
-        self._update_selection_label()
+        # 检查 widget 是否仍然有效
+        if not (thumb and hasattr(thumb, 'parent') and thumb.parent() is not None):
+            return
+        try:
+            if thumb in self._selected_thumbs:
+                thumb.selected = False
+                self._selected_thumbs.remove(thumb)
+            else:
+                thumb.selected = True
+                self._selected_thumbs.append(thumb)
+            self._update_selection_label()
+        except RuntimeError:
+            # 忽略已删除的 widget
+            if thumb in self._selected_thumbs:
+                self._selected_thumbs.remove(thumb)
+                self._update_selection_label()
 
     def _update_selection_label(self) -> None:
         n = len(self._selected_thumbs)
         self._selection_label.setText(f"已选择 {n} 张" if n > 0 else "")
 
     def _on_thumb_clicked(self, thumb: ThumbnailWidget, event: QMouseEvent) -> None:
+        # 检查 widget 是否仍然有效
+        if not (thumb and hasattr(thumb, 'parent') and thumb.parent() is not None):
+            return
         modifiers = event.modifiers()
 
         if modifiers & Qt.KeyboardModifier.ControlModifier:
@@ -585,12 +332,29 @@ class SplitDialog(QDialog):
 
     def _on_thumb_drag_started(self, thumb: ThumbnailWidget) -> None:
         """拖拽开始时，如果该缩略图在选中集合中，则批量拖拽所有选中图片。"""
-        if thumb in self._selected_thumbs and len(self._selected_thumbs) > 1:
-            thumb._batch_drag_paths = [
-                str(t.image_path) for t in self._selected_thumbs
-            ]
-        else:
-            thumb._batch_drag_paths = None
+        # 检查 widget 是否仍然有效
+        if not (thumb and hasattr(thumb, 'parent') and thumb.parent() is not None):
+            return
+        try:
+            if thumb in self._selected_thumbs and len(self._selected_thumbs) > 1:
+                # 过滤掉已删除的 widget
+                valid_thumbs = []
+                for t in self._selected_thumbs:
+                    if t and hasattr(t, 'parent') and t.parent() is not None:
+                        try:
+                            # 尝试访问属性以检查 widget 是否有效
+                            _ = t.image_path
+                            valid_thumbs.append(t)
+                        except RuntimeError:
+                            pass
+                thumb._batch_drag_paths = [
+                    str(t.image_path) for t in valid_thumbs
+                ]
+            else:
+                thumb._batch_drag_paths = None
+        except RuntimeError:
+            # 忽略已删除的 widget
+            pass
 
     def _connect_thumb_signals(self, thumb: ThumbnailWidget) -> None:
         thumb.clicked.connect(self._on_thumb_clicked)
@@ -831,12 +595,46 @@ class SplitDialog(QDialog):
             self._recluster_timer.start()  # 防抖：300ms 内无新变化才执行
 
     def _do_recluster(self) -> None:
-        """防抖后实际执行重聚类。"""
+        """防抖后实际执行重聚类。
+
+        <=500 张图片在主线程同步执行（<50ms）；
+        >500 张图片在后台线程执行，避免冻结 GUI。
+        """
         if self._result is None:
             return
-        self.setCursor(Qt.CursorShape.WaitCursor)
-        self._result = recluster(self._result, self._threshold)
+        # 取消上一次后台重聚类（如果还在运行）
+        if self._recluster_worker and self._recluster_worker.isRunning():
+            self._recluster_worker.cancel()
+            self._recluster_worker.wait(1000)
+        n = len(self._result.image_paths)
+        if n > 500:
+            # 大数据集：后台线程
+            self._slider.setEnabled(False)
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            self._status_label.setText("正在重新聚类...")
+
+            self._recluster_worker = ReclusterWorker(self._result, self._threshold)
+            self._recluster_worker.finished_ok.connect(self._on_recluster_done)
+            self._recluster_worker.finished_err.connect(self._on_recluster_error)
+            self._recluster_worker.start()
+        else:
+            # 小数据集：主线程同步
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            self._result = recluster(self._result, self._threshold)
+            self._rebuild_groups()
+            self.unsetCursor()
+
+    @Slot(object)
+    def _on_recluster_done(self, result: SplitResult) -> None:
+        self._result = result
         self._rebuild_groups()
+        self._slider.setEnabled(True)
+        self.unsetCursor()
+
+    @Slot(str)
+    def _on_recluster_error(self, error: str) -> None:
+        self._status_label.setText(f"重聚类失败：{error}")
+        self._slider.setEnabled(True)
         self.unsetCursor()
 
     # ── 分组 UI 构建 ───────────────────────────────────────────
@@ -1037,6 +835,7 @@ class SplitDialog(QDialog):
     # ── 安全关闭 ──────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
+        self._recluster_timer.stop()
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             # 断开信号防止 worker 完成后发到已销毁的槽
@@ -1056,4 +855,12 @@ class SplitDialog(QDialog):
             except RuntimeError:
                 pass
             self._apply_worker.wait(3000)
+        if self._recluster_worker and self._recluster_worker.isRunning():
+            self._recluster_worker.cancel()
+            try:
+                self._recluster_worker.finished_ok.disconnect()
+                self._recluster_worker.finished_err.disconnect()
+            except (RuntimeError, AttributeError):
+                pass
+            self._recluster_worker.wait(3000)
         super().closeEvent(event)

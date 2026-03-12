@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -53,11 +54,11 @@ def pad_to_square(
     with Image.open(path) as raw_img:
         raw_img.load()  # 强制读入内存，立即释放文件句柄
 
-        # 保留 RGBA/P 模式的透明度信息，统一转为 RGB 输出
+        # 保留 RGBA/LA/P 模式的透明度信息，统一转为 RGB 输出
         if raw_img.mode in ("RGBA", "LA", "P"):
             img = Image.new("RGB", raw_img.size, fill_color)
-            conv = raw_img.convert("RGBA") if raw_img.mode == "P" else raw_img
-            img.paste(conv, mask=conv.split()[-1])
+            conv = raw_img.convert("RGBA") if raw_img.mode != "RGBA" else raw_img
+            img.paste(conv, mask=conv.split()[3])
         elif raw_img.mode != "RGB":
             img = raw_img.convert("RGB")
         else:
@@ -205,6 +206,7 @@ def is_white_background(
 
 
 _rembg_sessions: dict[str, object] = {}
+_rembg_lock = threading.Lock()
 
 
 def remove_background_to_white(
@@ -220,9 +222,10 @@ def remove_background_to_white(
     from rembg import new_session, remove
 
     img = Image.open(path).convert("RGB")
-    if model_name not in _rembg_sessions:
-        _rembg_sessions[model_name] = new_session(model_name)
-    session = _rembg_sessions[model_name]
+    with _rembg_lock:
+        if model_name not in _rembg_sessions:
+            _rembg_sessions[model_name] = new_session(model_name)
+        session = _rembg_sessions[model_name]
     # rembg 返回 RGBA；开启 alpha_matting 细化边缘
     result = remove(
         img,
@@ -281,6 +284,23 @@ def reorder_main_image(folder: Path, main_image: Path) -> None:
         raise
 
     # 阶段 2：改为最终名（带序号前缀）
-    for i, (tmp_path, base_name) in enumerate(tmp_pairs):
-        final_name = f"{i + 1:03d}_{base_name}"
-        tmp_path.rename(tmp_path.parent / final_name)
+    renamed_finals: list[tuple[Path, Path]] = []  # (final_path, tmp_path) 用于回滚
+    try:
+        for i, (tmp_path, base_name) in enumerate(tmp_pairs):
+            final_name = f"{i + 1:03d}_{base_name}"
+            final_path = tmp_path.parent / final_name
+            tmp_path.rename(final_path)
+            renamed_finals.append((final_path, tmp_path))
+    except OSError:
+        # 阶段 2 失败 → 回滚到原始文件名
+        for final_path, tmp_path_rb in reversed(renamed_finals):
+            try:
+                final_path.rename(tmp_path_rb)
+            except OSError:
+                pass
+        for tmp_path_rb, original_path in reversed(renamed_originals):
+            try:
+                tmp_path_rb.rename(original_path)
+            except OSError:
+                pass
+        raise

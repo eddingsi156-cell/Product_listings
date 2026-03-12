@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -38,28 +39,45 @@ class ProductInfo:
     detail_images: list[Path] = field(default_factory=list)
 
 
+_title_generator_instance: "TitleGenerator | None" = None
+_title_generator_lock = threading.Lock()
+
+
+def get_title_generator() -> "TitleGenerator":
+    """获取全局单例 TitleGenerator（线程安全）。"""
+    global _title_generator_instance
+    if _title_generator_instance is None:
+        with _title_generator_lock:
+            if _title_generator_instance is None:
+                _title_generator_instance = TitleGenerator()
+    return _title_generator_instance
+
+
 class TitleGenerator:
     """基于 CLIP zero-shot 分类的标题生成器。"""
 
+    _text_features: np.ndarray | None = None
+    _category_keys: list[str] = []
+    _initialized: bool = False
+
     def __init__(self) -> None:
-        self._text_features: np.ndarray | None = None
-        self._category_keys: list[str] = []
+        pass
 
     def _ensure_model(
         self, on_progress: Callable[[str], None] | None = None,
     ) -> None:
-        """确保 CLIP 模型已加载，并预计算类别文本特征。"""
+        """确保 CLIP 模型已加载，并预计算类别文本特征（类级别缓存）。"""
+        if TitleGenerator._initialized:
+            return
+
         ext = get_extractor()
         if not ext.loaded:
             ext.load_model(on_progress)
 
-        if self._text_features is not None:
-            return
-
         import open_clip
 
-        self._category_keys = list(CATEGORY_PROMPTS.keys())
-        prompts = [CATEGORY_PROMPTS[k][0] for k in self._category_keys]
+        TitleGenerator._category_keys = list(CATEGORY_PROMPTS.keys())
+        prompts = [CATEGORY_PROMPTS[k][0] for k in TitleGenerator._category_keys]
 
         tokenizer = open_clip.get_tokenizer(CLIP_MODEL_NAME)
         tokens = tokenizer(prompts).to(ext.device)
@@ -68,7 +86,8 @@ class TitleGenerator:
             text_feats = ext.model.encode_text(tokens)
             text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
 
-        self._text_features = text_feats.cpu().numpy().astype(np.float32)
+        TitleGenerator._text_features = text_feats.cpu().numpy().astype(np.float32)
+        TitleGenerator._initialized = True
 
     def classify_product(self, image_paths: list[Path]) -> str:
         """对产品图片做 zero-shot 分类，返回中文类别名。
@@ -93,9 +112,9 @@ class TitleGenerator:
         avg_feat /= norm
 
         # 余弦相似度
-        sims = avg_feat @ self._text_features.T  # (1, num_categories)
+        sims = avg_feat @ TitleGenerator._text_features.T  # (1, num_categories)
         best_idx = int(sims.argmax())
-        best_key = self._category_keys[best_idx]
+        best_key = TitleGenerator._category_keys[best_idx]
 
         return CATEGORY_PROMPTS[best_key][1]
 
@@ -114,7 +133,7 @@ class TitleGenerator:
         stock: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> list[ProductInfo]:
-        """批量为产品文件夹生成标题和图片列表。
+        """批量为产品文件夹生成标题和图片列表（优化：批量提取CLIP特征）。
 
         Args:
             product_folders: 每个文件夹包含一个产品的图片。
@@ -130,6 +149,8 @@ class TitleGenerator:
         results: list[ProductInfo] = []
         total = len(product_folders)
 
+        # 第一步：收集所有产品信息（不调用CLIP）
+        product_images: list[tuple[ProductInfo, list[Path]]] = []
         for i, folder in enumerate(product_folders):
             images = sorted(
                 p for p in folder.iterdir()
@@ -137,23 +158,69 @@ class TitleGenerator:
             )
 
             if not images:
-                # 空文件夹也创建占位，保持与输入列表的索引对应
                 results.append(ProductInfo(folder=folder, title="(空文件夹)"))
+                if on_progress:
+                    on_progress(i + 1, total)
             else:
-                title = self.generate_title(images)
                 main_imgs = images[:MAIN_IMAGE_MAX]
-                detail_imgs = images[MAIN_IMAGE_MAX:MAIN_IMAGE_MAX + DETAIL_IMAGE_MAX]
-
-                results.append(ProductInfo(
+                detail_imgs = images[MAIN_IMAGE_MAX:][:DETAIL_IMAGE_MAX]
+                product = ProductInfo(
                     folder=folder,
-                    title=title,
+                    title="",  # 稍后填充
                     price=price,
                     stock=stock,
                     main_images=main_imgs,
                     detail_images=detail_imgs,
-                ))
+                )
+                product_images.append((product, main_imgs[:5]))  # 最多5张做分类
 
-            if on_progress:
-                on_progress(i + 1, total)
+        # 第二步：批量提取所有产品的CLIP特征
+        if product_images:
+            all_paths = []
+            path_to_product: dict[int, tuple[ProductInfo, int]] = {}
+            for idx, (_, paths) in enumerate(product_images):
+                for p in paths:
+                    path_id = len(all_paths)
+                    all_paths.append(p)
+                    path_to_product[path_id] = (product_images[idx][0], idx)
+
+            if all_paths:
+                batch_size = getattr(ext, '_batch_size', 32)
+                all_feats = ext.extract_clip_batch(all_paths, batch_size)
+
+                # 按产品分组计算平均特征
+                product_feats: dict[int, np.ndarray] = {}
+                feat_idx = 0
+                for idx, (_, paths) in enumerate(product_images):
+                    n = len(paths)
+                    if n > 0 and feat_idx < len(all_feats):
+                        product_feats[idx] = all_feats[feat_idx:feat_idx + n].mean(axis=0, keepdims=True)
+                    feat_idx += n
+
+                # 计算分类
+                text_feats = TitleGenerator._text_features
+                for idx, (product, _) in enumerate(product_images):
+                    if idx in product_feats:
+                        avg_feat = product_feats[idx]
+                        norm = np.linalg.norm(avg_feat)
+                        if norm > 1e-8:
+                            avg_feat /= norm
+                            sims = avg_feat @ text_feats.T
+                            best_idx = int(sims.argmax())
+                            best_key = TitleGenerator._category_keys[best_idx]
+                            category = CATEGORY_PROMPTS[best_key][1]
+                        else:
+                            category = "商品"
+                    else:
+                        category = "商品"
+
+                    prefix = random.choice(TITLE_PREFIXES)
+                    style = random.choice(TITLE_STYLES)
+                    suffix = random.choice(TITLE_SUFFIXES)
+                    product.title = f"{prefix}{style}{category}{suffix}"
+                    results.append(product)
+
+                    if on_progress:
+                        on_progress(len(results), total)
 
         return results

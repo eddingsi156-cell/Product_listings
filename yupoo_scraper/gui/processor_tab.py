@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QModelIndex, QSortFilterProxyModel, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -15,8 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
-    QTableWidget,
-    QTableWidgetItem,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +36,15 @@ from ..ml.splitter import (
 )
 from ..organizer import find_image_folders
 from .base_worker import BaseWorker
+from .models import (
+    ButtonDelegate,
+    ROLE_ACTION_COLOR,
+    ROLE_ACTION_TEXT,
+    ROLE_ACTION_TOOLTIP,
+    ROLE_ACTION_TYPE,
+    ROLE_RAW_DATA,
+    VirtualTableModel,
+)
 from .split_dialog import SplitDialog
 from .widgets import StatusProgressBar
 
@@ -50,10 +60,11 @@ class BatchScanWorker(BaseWorker):
     folder_done = Signal(int, int, object)   # (idx, total, BatchScanItem)
     finished_ok = Signal(list)               # list[BatchScanItem]
 
-    def __init__(self, folders: list[Path], threshold: float):
+    def __init__(self, folders: list[Path], threshold: float, force: bool = False):
         super().__init__()
         self._folders = folders
         self._threshold = threshold
+        self._force = force
 
     def _run(self) -> None:
         results = batch_extract_and_split(
@@ -64,6 +75,7 @@ class BatchScanWorker(BaseWorker):
             on_status=lambda msg: self.status.emit(msg),
             on_image_progress=lambda c, t: self.image_progress.emit(c, t),
             on_folder_done=lambda i, t, item: self.folder_done.emit(i, t, item),
+            force=self._force,
         )
         self.finished_ok.emit(results)
 
@@ -73,6 +85,129 @@ class BatchScanWorker(BaseWorker):
 _FILTER_ALL = 0
 _FILTER_NEED_SPLIT = 1
 _FILTER_NO_SPLIT = 2
+
+
+# ── ProcessorTableModel ──────────────────────────────────────
+
+class ProcessorTableModel(VirtualTableModel):
+    """处理结果表格模型。"""
+
+    _HEADERS = ["状态", "文件夹名称", "图片数", "分组数", "操作"]
+
+    @property
+    def _headers(self) -> list[str]:
+        return self._HEADERS
+
+    def _column_data(self, row, col, role):
+        item: BatchScanItem = self._items[row]
+
+        if role == ROLE_RAW_DATA:
+            return item
+
+        # 文本对齐
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if col in (0, 2, 3):
+                return int(Qt.AlignmentFlag.AlignCenter)
+            return None
+
+        # 操作列
+        if col == 4:
+            return self._action_data(item, role)
+
+        # DisplayRole
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 0:
+                return self._status_text(item)
+            elif col == 1:
+                return item.folder.name
+            elif col == 2:
+                return str(item.image_count)
+            elif col == 3:
+                return str(item.group_count)
+
+        # ForegroundRole (状态列)
+        if role == Qt.ItemDataRole.ForegroundRole and col == 0:
+            return self._status_color(item)
+
+        # ToolTipRole
+        if role == Qt.ItemDataRole.ToolTipRole and col == 0:
+            if item.error:
+                return item.error
+            if item.group_count > 1:
+                return "需要拆分"
+            return "无需拆分"
+
+        return None
+
+    def _status_text(self, item: BatchScanItem) -> str:
+        if item.error:
+            return "X"
+        if item.group_count > 1:
+            return "!"
+        return "OK"
+
+    def _status_color(self, item: BatchScanItem) -> QColor | None:
+        if item.error:
+            return QColor(Qt.GlobalColor.red)
+        if item.group_count > 1:
+            return QColor(Qt.GlobalColor.darkYellow)
+        return QColor(Qt.GlobalColor.darkGreen)
+
+    def _action_data(self, item: BatchScanItem, role: int):
+        if role == ROLE_ACTION_TYPE:
+            if item.error:
+                return "label"
+            if item.group_count > 1:
+                return "button"
+            return "label"
+
+        if role == ROLE_ACTION_TEXT:
+            if item.error:
+                return "出错"
+            if item.group_count > 1:
+                return "审核"
+            return "—"
+
+        if role == ROLE_ACTION_COLOR:
+            if item.error:
+                return "red"
+            return None
+
+        if role == ROLE_ACTION_TOOLTIP:
+            if item.error:
+                return item.error
+            return None
+
+        return None
+
+
+# ── ProcessorFilterProxy ─────────────────────────────────────
+
+class ProcessorFilterProxy(QSortFilterProxyModel):
+    """处理结果筛选代理。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_id = _FILTER_ALL
+
+    def set_filter(self, filter_id: int) -> None:
+        self._filter_id = filter_id
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if self._filter_id == _FILTER_ALL:
+            return True
+
+        model = self.sourceModel()
+        item = model.get_item(source_row)
+        if item is None:
+            return False
+
+        needs_split = item.group_count > 1
+        if self._filter_id == _FILTER_NEED_SPLIT:
+            return needs_split
+        else:  # _FILTER_NO_SPLIT
+            return not needs_split
 
 
 # ── ProcessorTab ───────────────────────────────────────────────
@@ -86,7 +221,6 @@ class ProcessorTab(QWidget):
         super().__init__(parent)
         self._download_dir: Path = config.DEFAULT_DOWNLOAD_DIR.resolve()
         self._worker: BatchScanWorker | None = None
-        self._scan_results: list[BatchScanItem] = []
         self._current_filter = _FILTER_ALL
         self._recluster_timer = QTimer(self)
         self._recluster_timer.setSingleShot(True)
@@ -124,6 +258,10 @@ class ProcessorTab(QWidget):
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop)
         ctrl_layout.addWidget(self._btn_stop)
+
+        self._chk_force = QCheckBox("忽略历史")
+        self._chk_force.setToolTip("勾选后强制重新扫描已拆分过的文件夹")
+        ctrl_layout.addWidget(self._chk_force)
 
         ctrl_layout.addSpacing(16)
         ctrl_layout.addWidget(QLabel("灵敏度:"))
@@ -178,11 +316,13 @@ class ProcessorTab(QWidget):
 
         main_layout.addLayout(filter_layout)
 
-        # ── 结果表格 ──────────────────────────────────────────
-        self._table = QTableWidget(0, 5)
-        self._table.setHorizontalHeaderLabels(
-            ["状态", "文件夹名称", "图片数", "分组数", "操作"]
-        )
+        # ── 结果表格 (Model/View) ────────────────────────────
+        self._model = ProcessorTableModel(self)
+        self._proxy = ProcessorFilterProxy(self)
+        self._proxy.setSourceModel(self._model)
+
+        self._table = QTableView()
+        self._table.setModel(self._proxy)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
@@ -194,7 +334,19 @@ class ProcessorTab(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
 
+        # 操作列委托
+        self._action_delegate = ButtonDelegate(
+            on_click=self._on_review, parent=self._table
+        )
+        self._table.setItemDelegateForColumn(4, self._action_delegate)
+
         main_layout.addWidget(self._table, 1)
+
+    # ── 便捷属性 ─────────────────────────────────────────────
+
+    @property
+    def _scan_results(self) -> list[BatchScanItem]:
+        return self._model.items
 
     # ── 目录浏览 ───────────────────────────────────────────────
 
@@ -223,8 +375,7 @@ class ProcessorTab(QWidget):
             return
 
         # 重置状态
-        self._scan_results.clear()
-        self._table.setRowCount(0)
+        self._model.clear()
         self._update_summary()
 
         threshold = self._slider.value() / 100.0
@@ -233,7 +384,8 @@ class ProcessorTab(QWidget):
         self._btn_stop.setEnabled(True)
         self._slider.setEnabled(False)
 
-        self._worker = BatchScanWorker(folders, threshold)
+        force = self._chk_force.isChecked()
+        self._worker = BatchScanWorker(folders, threshold, force=force)
         self._worker.status.connect(self._on_worker_status)
         self._worker.folder_started.connect(self._on_folder_started)
         self._worker.image_progress.connect(self._on_image_progress)
@@ -262,13 +414,11 @@ class ProcessorTab(QWidget):
 
     @Slot(int, int)
     def _on_image_progress(self, current: int, total: int) -> None:
-        # 图片级进度显示在 stats 里
         self._progress.set_stats(f"图片 {current}/{total}")
 
     @Slot(int, int, object)
     def _on_folder_done(self, idx: int, total: int, item: BatchScanItem) -> None:
-        self._scan_results.append(item)
-        self._add_table_row(item)
+        self._model.append_item(item)
         self._progress.set_progress(idx + 1, total)
         self._update_summary()
 
@@ -277,8 +427,9 @@ class ProcessorTab(QWidget):
         self._btn_scan.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._slider.setEnabled(True)
-        n = len(self._scan_results)
-        need = sum(1 for r in self._scan_results if r.group_count > 1)
+        items = self._scan_results
+        n = len(items)
+        need = sum(1 for r in items if r.group_count > 1)
         self._progress.set_status(f"扫描完成: {n} 个文件夹, {need} 个需拆分")
         self._progress.set_stats("")
         self._progress.set_progress(n, n)
@@ -294,88 +445,6 @@ class ProcessorTab(QWidget):
         self.status_message.emit(f"扫描出错: {error}")
         self._worker = None
 
-    # ── 表格操作 ───────────────────────────────────────────────
-
-    def _add_table_row(self, item: BatchScanItem) -> None:
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        # 状态列
-        status_item = QTableWidgetItem()
-        status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._update_status_cell(status_item, item)
-        self._table.setItem(row, 0, status_item)
-
-        # 文件夹名称
-        name_item = QTableWidgetItem(item.folder.name)
-        self._table.setItem(row, 1, name_item)
-
-        # 图片数
-        count_item = QTableWidgetItem(str(item.image_count))
-        count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._table.setItem(row, 2, count_item)
-
-        # 分组数
-        group_item = QTableWidgetItem(str(item.group_count))
-        group_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._table.setItem(row, 3, group_item)
-
-        # 操作列 — 审核按钮或占位
-        if item.error:
-            btn = QLabel("出错")
-            btn.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            btn.setStyleSheet("color: red;")
-            btn.setToolTip(item.error)
-        elif item.group_count > 1:
-            btn = QPushButton("审核")
-            btn.clicked.connect(lambda _=None, r=row: self._on_review(r))
-        else:
-            btn = QLabel("—")
-            btn.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._table.setCellWidget(row, 4, btn)
-
-    def _update_status_cell(self, cell: QTableWidgetItem, item: BatchScanItem) -> None:
-        if item.error:
-            cell.setText("X")
-            cell.setToolTip(item.error)
-            cell.setForeground(Qt.GlobalColor.red)
-        elif item.group_count > 1:
-            cell.setText("!")
-            cell.setToolTip("需要拆分")
-            cell.setForeground(Qt.GlobalColor.darkYellow)
-        else:
-            cell.setText("OK")
-            cell.setToolTip("无需拆分")
-            cell.setForeground(Qt.GlobalColor.darkGreen)
-
-    def _refresh_table_row(self, row: int) -> None:
-        """刷新指定行的数据（灵敏度变化或拆分完成后）。"""
-        item = self._scan_results[row]
-
-        # 状态
-        status_cell = self._table.item(row, 0)
-        self._update_status_cell(status_cell, item)
-
-        # 分组数
-        self._table.item(row, 3).setText(str(item.group_count))
-
-        # 操作列
-        if item.error:
-            widget = QLabel("出错")
-            widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            widget.setStyleSheet("color: red;")
-            widget.setToolTip(item.error)
-        elif item.group_count > 1:
-            btn = QPushButton("审核")
-            btn.clicked.connect(lambda _=None, r=row: self._on_review(r))
-            widget = btn
-        else:
-            widget = QLabel("—")
-            widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._table.setCellWidget(row, 4, widget)
-
-        self._apply_row_filter(row)
-
     # ── 灵敏度滑块 ─────────────────────────────────────────────
 
     @Slot(int)
@@ -387,25 +456,22 @@ class ProcessorTab(QWidget):
 
     def _do_recluster(self) -> None:
         """防抖后实际执行重聚类。"""
-        from PySide6.QtWidgets import QApplication
-
-        # 禁用滑块防止重入（processEvents 期间用户可能继续拖动）
         self._slider.setEnabled(False)
         try:
             threshold = self._slider.value() / 100.0
-            for i, item in enumerate(self._scan_results):
+            items = self._scan_results
+            for i, item in enumerate(items):
                 if item.error or item.image_count == 0:
                     continue
                 new_result = recluster(item.result, threshold)
-                self._scan_results[i] = BatchScanItem(
+                self._model.set_item(i, BatchScanItem(
                     folder=item.folder,
                     image_count=item.image_count,
                     group_count=len(new_result.groups),
                     result=new_result,
                     error=None,
-                )
-                self._refresh_table_row(i)
-                QApplication.processEvents()  # 避免大量结果时 UI 冻结
+                ))
+            self._proxy.invalidateFilter()
             self._update_summary()
         finally:
             self._slider.setEnabled(True)
@@ -415,25 +481,12 @@ class ProcessorTab(QWidget):
     @Slot(int)
     def _on_filter_changed(self, filter_id: int) -> None:
         self._current_filter = filter_id
-        for row in range(self._table.rowCount()):
-            self._apply_row_filter(row)
-
-    def _apply_row_filter(self, row: int) -> None:
-        if row >= len(self._scan_results):
-            return
-        item = self._scan_results[row]
-        needs_split = item.group_count > 1
-
-        if self._current_filter == _FILTER_ALL:
-            self._table.setRowHidden(row, False)
-        elif self._current_filter == _FILTER_NEED_SPLIT:
-            self._table.setRowHidden(row, not needs_split)
-        else:  # _FILTER_NO_SPLIT
-            self._table.setRowHidden(row, needs_split)
+        self._proxy.set_filter(filter_id)
 
     def _update_summary(self) -> None:
-        total = len(self._scan_results)
-        need = sum(1 for r in self._scan_results if r.group_count > 1)
+        items = self._scan_results
+        total = len(items)
+        need = sum(1 for r in items if r.group_count > 1)
         self._summary_label.setText(f"共 {total} 个, {need} 个需拆分")
 
     # ── 审核 ───────────────────────────────────────────────────
@@ -453,24 +506,14 @@ class ProcessorTab(QWidget):
         result = dlg.exec()
 
         if result == SplitDialog.DialogCode.Accepted:
-            # 拆分完成 — 标记为已拆分（分组数设为 0 表示已处理）
-            self._scan_results[row] = BatchScanItem(
+            # 拆分完成 — 标记为已拆分
+            self._model.set_item(row, BatchScanItem(
                 folder=item.folder,
                 image_count=item.image_count,
                 group_count=0,
                 result=item.result,
                 error=None,
-            )
-            # 更新状态列为"已拆分"
-            status_cell = self._table.item(row, 0)
-            status_cell.setText("OK")
-            status_cell.setToolTip("已拆分")
-            status_cell.setForeground(Qt.GlobalColor.darkGreen)
-            self._table.item(row, 3).setText("已拆分")
-            lbl = QLabel("已完成")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: green;")
-            self._table.setCellWidget(row, 4, lbl)
+            ))
             self._update_summary()
             self.status_message.emit(f"已拆分: {item.folder.name}")
 
@@ -487,6 +530,7 @@ class ProcessorTab(QWidget):
 
     def cleanup(self) -> None:
         """应用关闭时调用，取消后台 Worker。"""
+        self._recluster_timer.stop()
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)

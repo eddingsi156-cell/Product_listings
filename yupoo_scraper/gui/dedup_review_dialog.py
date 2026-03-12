@@ -190,13 +190,21 @@ class DedupReviewDialog(QDialog):
         self._btn_prev.setEnabled(idx > 0)
         self._btn_next.setEnabled(idx < len(self._matches) - 1)
 
-        # 重新创建容器（setWidget 自动处理旧 widget 的生命周期）
+        # 清理旧容器（takeWidget 移除所有权后手动销毁，避免内存泄漏）
+        old_widget = self._exist_scroll.takeWidget()
+        if old_widget is not None:
+            old_widget.deleteLater()
         self._exist_thumb_container = QWidget()
         self._exist_flow = FlowLayout(self._exist_thumb_container, spacing=4)
         self._exist_scroll.setWidget(self._exist_thumb_container)
 
-        # 加载已有产品图片
+        # 加载已有产品图片（尝试修正路径：如果绝对路径不存在，尝试用当前下载目录拼接）
         exist_folder = Path(product.folder)
+        if not exist_folder.exists():
+            from ..config import DEFAULT_DOWNLOAD_DIR
+            alt_folder = DEFAULT_DOWNLOAD_DIR / exist_folder.name
+            if alt_folder.exists():
+                exist_folder = alt_folder
         logger.info("加载已有产品图片: folder=%s, exists=%s", exist_folder, exist_folder.exists())
         if exist_folder.exists():
             exist_images = list_images(exist_folder)
