@@ -457,16 +457,18 @@ class WeidianUploader:
             ref_box = bg_box if used_bg_screenshot else iframe_box
             gap_page_x = ref_box["x"] + gap_x_css
 
-            # 滑块中心 X
-            slider_center_x = slider_box["x"] + slider_box["width"] / 2
-            slide_distance = max(1, int(gap_page_x - slider_center_x))
+            # 滑动距离 = 缺口在背景图中的 X 坐标
+            # 拼图块从背景图左侧起始，拖拽 D 像素 → 拼图块移动 D 像素
+            # 所以距离就是 gap_x_css 相对于背景图左边缘的偏移
+            # 注意：之前用 gap_page_x - slider_center_x 会偏短半个滑块宽度
+            slide_distance = max(1, int(gap_page_x - bg_box["x"]))
 
             logger.info(
                 "DPR=%.2f, 截图gap_x=%d, CSS gap_x=%.1f, "
-                "基准=%s(X=%.0f), 滑块中心X=%.0f, 滑动距离=%d",
+                "基准=%s(X=%.0f), bg_box.x=%.0f, 滑动距离=%d",
                 dpr, gap_x, gap_x_css,
                 "bg" if used_bg_screenshot else "iframe",
-                ref_box["x"], slider_center_x, slide_distance,
+                ref_box["x"], bg_box["x"], slide_distance,
             )
             step(f"缺口 X={gap_x}(截图)/{gap_x_css:.0f}(CSS), "
                  f"滑动距离={slide_distance}px")
