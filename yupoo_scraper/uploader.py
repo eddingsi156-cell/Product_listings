@@ -378,15 +378,16 @@ class WeidianUploader:
                     await self._click_captcha_refresh(page, frame)
                     continue
 
-            # ── 3. 截图验证码区域 ────────────────────────────────
+            # ── 3. 截图验证码背景图区域（只截背景图，不含滑块栏等 UI） ──
+            used_bg_screenshot = True  # 追踪截图来源，影响坐标基准
             try:
-                # 截取整个 iframe 区域（包含背景图+拼图+滑块）
-                screenshot = await iframe_loc.screenshot(type="png")
+                screenshot = await bg_img.screenshot(type="png")
             except Exception:
+                used_bg_screenshot = False
                 try:
-                    # 退而求其次：截取外层容器
-                    container = page.locator("#tcaptcha_transform").first
-                    screenshot = await container.screenshot(type="png")
+                    # 退而求其次：截取整个 iframe
+                    screenshot = await iframe_loc.screenshot(type="png")
+                    logger.warning("背景图截图失败，退回 iframe 全截图 (第%d次)", attempt + 1)
                 except Exception as e:
                     logger.error("验证码截图失败 (第%d次): %s", attempt + 1, e)
                     continue
@@ -404,6 +405,11 @@ class WeidianUploader:
             try:
                 gap_x = await solver.recognize_gap(screenshot)
                 logger.info("识别缺口 X=%d (第%d次)", gap_x, attempt + 1)
+            except ValueError as e:
+                # 不可重试错误（余额不足、账号问题）→ 直接终止
+                logger.error("打码平台账号异常，终止重试: %s", e)
+                step(str(e))
+                return False
             except Exception as e:
                 logger.warning("验证码识别失败 (第%d次): %s", attempt + 1, e)
                 await self._click_captcha_refresh(page, frame)
@@ -432,22 +438,38 @@ class WeidianUploader:
                 continue
 
             # ── 6. 计算滑动距离并执行拖拽 ────────────────────────
-            # gap_x 是相对于截图（=iframe 区域）的像素坐标
-            # 腾讯验证码的滑块初始位置在左侧约 30px 处
-            # 需要减去滑块起始位置得到实际滑动距离
             slider_box = await slider.bounding_box()
+            bg_box = await bg_img.bounding_box()
             iframe_box = await iframe_loc.bounding_box()
 
-            if not slider_box or not iframe_box:
+            if not slider_box or not bg_box or not iframe_box:
                 logger.warning("无法获取元素位置 (第%d次)", attempt + 1)
                 continue
 
-            # 滑块相对于 iframe 左边的偏移
-            slider_offset_x = slider_box["x"] - iframe_box["x"]
-            slide_distance = max(1, gap_x - slider_offset_x - slider_box["width"] / 2)
+            # DPR 缩放校正：screenshot() 按 devicePixelRatio 截图，
+            # 图鉴返回的 gap_x 是截图像素坐标，需要换算回 CSS 像素
+            dpr = await page.evaluate("window.devicePixelRatio || 1")
+            gap_x_css = gap_x / dpr
 
-            step(f"缺口 X={gap_x}, 滑块偏移={slider_offset_x:.0f}, "
-                 f"滑动距离={slide_distance:.0f}px")
+            # 根据截图来源选择坐标基准：
+            # - 背景图截图 → gap_x_css 相对于 bg_box
+            # - iframe 全截图 → gap_x_css 相对于 iframe_box
+            ref_box = bg_box if used_bg_screenshot else iframe_box
+            gap_page_x = ref_box["x"] + gap_x_css
+
+            # 滑块中心 X
+            slider_center_x = slider_box["x"] + slider_box["width"] / 2
+            slide_distance = max(1, int(gap_page_x - slider_center_x))
+
+            logger.info(
+                "DPR=%.2f, 截图gap_x=%d, CSS gap_x=%.1f, "
+                "基准=%s(X=%.0f), 滑块中心X=%.0f, 滑动距离=%d",
+                dpr, gap_x, gap_x_css,
+                "bg" if used_bg_screenshot else "iframe",
+                ref_box["x"], slider_center_x, slide_distance,
+            )
+            step(f"缺口 X={gap_x}(截图)/{gap_x_css:.0f}(CSS), "
+                 f"滑动距离={slide_distance}px")
 
             # 腾讯验证码在 iframe 内，但鼠标操作在主页面坐标系
             # perform_slide 需要用主页面的 page 对象
@@ -469,8 +491,17 @@ class WeidianUploader:
                 try:
                     still_visible = await iframe_loc.is_visible(timeout=500)
                     if not still_visible:
-                        captcha_passed = True
-                        break
+                        # 二次确认：iframe 消失后再等 1.5 秒，
+                        # 排除腾讯验证码刷新间隙的短暂消失
+                        await asyncio.sleep(1.5)
+                        try:
+                            still_there = await iframe_loc.is_visible(timeout=500)
+                        except Exception:
+                            still_there = False
+                        if not still_there:
+                            captcha_passed = True
+                            break
+                        # iframe 重新出现 = 刷新了新题，继续轮询
                 except Exception:
                     # 元素已从 DOM 移除 = 通过
                     captcha_passed = True
@@ -499,10 +530,10 @@ class WeidianUploader:
     @staticmethod
     async def _click_captcha_refresh(page, frame) -> None:
         """点击腾讯验证码的刷新按钮。"""
-        # 先尝试外层刷新按钮
-        for sel in ["#ticon_refresh", ".ticon-refresh"]:
+        # 优先 iframe 内的刷新按钮（腾讯验证码的按钮在 iframe 内）
+        for sel in [".tc-action-icon:has(.tc-icon-refresh)", "#reload"]:
             try:
-                btn = page.locator(sel).first
+                btn = frame.locator(sel).first
                 if await btn.is_visible(timeout=1000):
                     await btn.click()
                     await asyncio.sleep(2)
@@ -510,10 +541,10 @@ class WeidianUploader:
             except Exception:
                 continue
 
-        # 再尝试 iframe 内的刷新
-        for sel in [".tc-action-icon:has(.tc-icon-refresh)", "#reload"]:
+        # 再尝试外层刷新按钮（旧版本验证码）
+        for sel in ["#ticon_refresh", ".ticon-refresh"]:
             try:
-                btn = frame.locator(sel).first
+                btn = page.locator(sel).first
                 if await btn.is_visible(timeout=1000):
                     await btn.click()
                     await asyncio.sleep(2)
@@ -540,6 +571,10 @@ class WeidianUploader:
         track = generate_human_track(distance)
         cx, cy = start_x, start_y
         for dx, dy, dt in track:
+            if dx == 0 and dy == 0:
+                # 纯停顿，不产生多余鼠标事件
+                await asyncio.sleep(dt / 1000)
+                continue
             cx += dx
             cy += dy
             await page.mouse.move(cx, cy)

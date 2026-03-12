@@ -132,6 +132,7 @@ class TitleGenerator:
         price: float = 0.0,
         stock: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
+        max_main_images: int = MAIN_IMAGE_MAX,
     ) -> list[ProductInfo]:
         """批量为产品文件夹生成标题和图片列表（优化：批量提取CLIP特征）。
 
@@ -162,8 +163,8 @@ class TitleGenerator:
                 if on_progress:
                     on_progress(i + 1, total)
             else:
-                main_imgs = images[:MAIN_IMAGE_MAX]
-                detail_imgs = images[MAIN_IMAGE_MAX:][:DETAIL_IMAGE_MAX]
+                main_imgs = images[:max_main_images]
+                detail_imgs = images[max_main_images:][:DETAIL_IMAGE_MAX]
                 product = ProductInfo(
                     folder=folder,
                     title="",  # 稍后填充

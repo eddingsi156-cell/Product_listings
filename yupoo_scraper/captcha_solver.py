@@ -37,32 +37,45 @@ def generate_human_track(distance: int) -> list[tuple[int, int, int]]:
     track: list[tuple[int, int, int]] = []
     traveled = 0  # 整数累加，保证精确
 
-    # 先加速到 60%，再减速到终点
-    mid = distance * 0.6
+    # 按下后短暂停顿（模拟反应时间）
+    track.append((0, 0, random.randint(80, 200)))
+
+    # 三阶段：慢启动 → 快速滑动 → 精确减速
+    phase1 = distance * 0.15  # 慢启动
+    phase2 = distance * 0.70  # 快速阶段结束点
 
     while traveled < distance:
         remaining = distance - traveled
-        if traveled < mid:
-            # 加速阶段：步长 3~8
-            step_f = random.uniform(3, 8)
+        if traveled < phase1:
+            # 慢启动：小步、较长间隔
+            step_f = random.uniform(1, 3)
+            dt = random.randint(18, 35)
+        elif traveled < phase2:
+            # 快速阶段：大步、短间隔
+            step_f = random.uniform(5, 12)
+            dt = random.randint(6, 18)
         else:
-            # 减速阶段：步长 1~4，越接近越小
-            step_f = max(1.0, random.uniform(1, 4) * (remaining / distance))
+            # 精确减速：越接近终点步长越小
+            ratio = remaining / distance
+            step_f = max(1.0, random.uniform(1, 3) * ratio * 4)
+            dt = random.randint(20, 45)
 
         dx = max(1, min(round(step_f), remaining))
         traveled += dx
 
-        # 轻微 Y 轴抖动
-        dy = random.randint(-2, 2)
-        # 每步间隔 8~25ms
-        dt = random.randint(8, 25)
+        # 轻微 Y 轴抖动（快速阶段抖动更大）
+        y_range = 3 if traveled < phase2 else 1
+        dy = random.randint(-y_range, y_range)
         track.append((dx, dy, dt))
 
-    # 可能略微过冲再回调（净额为 0，不影响总距离）
-    if random.random() < 0.3:
-        overshoot = random.randint(2, 6)
-        track.append((overshoot, 0, random.randint(30, 60)))
-        track.append((-overshoot, 0, random.randint(50, 100)))
+    # 到达后短暂停顿（模拟确认）
+    track.append((0, 0, random.randint(30, 80)))
+
+    # 过冲 + 回调（概率 40%，更拟人）
+    if random.random() < 0.4:
+        overshoot = random.randint(3, 8)
+        track.append((overshoot, random.randint(-1, 1), random.randint(20, 50)))
+        track.append((-overshoot, random.randint(-1, 1), random.randint(60, 120)))
 
     return track
 
@@ -93,7 +106,9 @@ class CaptchaSolver:
         """获取复用的 session，或创建临时 session。"""
         if self._session and not self._session.closed:
             return self._session
-        # 未通过 async with 使用时，创建新 session（由调用方负责关闭）
+        # 先关闭旧 session（如果存在但已关闭），防止泄漏
+        if self._session is not None:
+            self._session = None
         self._session = aiohttp.ClientSession()
         return self._session
 
@@ -117,16 +132,16 @@ class TTShituSolver(CaptchaSolver):
     """图鉴打码平台 (ttshitu.com)。
 
     注册后获取 username/password。
-    滑块验证码 typeId = 27（滑块拼图，返回 X 坐标）。
+    滑块验证码 typeId = 33（滑块缺口识别，返回缺口 X 坐标）。
     """
 
     API_URL = "https://api.ttshitu.com/predict"
 
-    def __init__(self, username: str, password: str, type_id: int = 27):
+    def __init__(self, username: str, password: str, type_id: int = 33):
         super().__init__()
         self._username = username
         self._password = password
-        self._type_id = type_id  # 27=滑块拼图
+        self._type_id = type_id  # 33=滑块缺口识别
 
     async def recognize_gap(self, image_bytes: bytes) -> int:
         b64 = base64.b64encode(image_bytes).decode()
@@ -147,9 +162,12 @@ class TTShituSolver(CaptchaSolver):
             data = await resp.json()
 
         if not data.get("success"):
-            raise RuntimeError(
-                f"图鉴识别失败: {data.get('message', '未知错误')}"
-            )
+            msg = data.get("message", "未知错误")
+            # 区分不可重试错误（余额不足、账号问题）和临时错误
+            fatal_keywords = ("余额", "用户名", "密码", "账号", "封禁", "冻结")
+            if any(kw in msg for kw in fatal_keywords):
+                raise ValueError(f"图鉴账号错误（不可重试）: {msg}")
+            raise RuntimeError(f"图鉴识别失败: {msg}")
 
         result = data["data"]["result"]
         logger.info("图鉴返回结果: %s", result)
@@ -167,11 +185,12 @@ class TTShituSolver(CaptchaSolver):
 class TwoCaptchaSolver(CaptchaSolver):
     """2Captcha 打码平台 (2captcha.com)。
 
-    滑块验证码用 coordinatescaptcha 类型。
+    使用 type=slider 提交滑块验证码截图，返回滑块缺口的 X 坐标。
     """
 
-    SUBMIT_URL = "https://2captcha.com/in.php"
-    RESULT_URL = "https://2captcha.com/res.php"
+    # 2Captcha JSON API v2
+    SUBMIT_URL = "https://api.2captcha.com/createTask"
+    RESULT_URL = "https://api.2captcha.com/getTaskResult"
 
     def __init__(self, api_key: str):
         super().__init__()
@@ -180,13 +199,13 @@ class TwoCaptchaSolver(CaptchaSolver):
     async def recognize_gap(self, image_bytes: bytes) -> int:
         b64 = base64.b64encode(image_bytes).decode()
 
-        # 提交任务
-        submit_data = {
-            "key": self._api_key,
-            "method": "base64",
-            "coordinatescaptcha": "1",
-            "body": b64,
-            "json": "1",
+        # 使用 SliderCaptcha 任务类型
+        payload = {
+            "clientKey": self._api_key,
+            "task": {
+                "type": "SliderCaptchaTask",
+                "body": b64,
+            },
         }
 
         session = await self._get_session()
@@ -194,17 +213,17 @@ class TwoCaptchaSolver(CaptchaSolver):
         # 提交
         async with session.post(
             self.SUBMIT_URL,
-            data=submit_data,
+            json=payload,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             data = await resp.json()
 
-        if data.get("status") != 1:
+        if data.get("errorId", 0) != 0:
             raise RuntimeError(
-                f"2Captcha 提交失败: {data.get('request', '未知错误')}"
+                f"2Captcha 提交失败: {data.get('errorDescription', data.get('errorCode', '未知错误'))}"
             )
 
-        task_id = data["request"]
+        task_id = data["taskId"]
         logger.info("2Captcha 任务已提交: %s", task_id)
 
         # 官方建议首次等 5 秒再轮询，之后每 2 秒（最多 ~65 秒）
@@ -212,30 +231,26 @@ class TwoCaptchaSolver(CaptchaSolver):
         for _ in range(30):
             await asyncio.sleep(2)
 
-            async with session.get(
+            async with session.post(
                 self.RESULT_URL,
-                params={
-                    "key": self._api_key,
-                    "action": "get",
-                    "id": task_id,
-                    "json": "1",
-                },
+                json={"clientKey": self._api_key, "taskId": task_id},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 result = await resp.json()
 
-            if result.get("status") == 1:
-                # 返回格式: "coordinates:x=123,y=456"
-                answer = result["request"]
-                logger.info("2Captcha 返回结果: %s", answer)
-                if "x=" in answer:
-                    x_part = answer.split("x=")[1].split(",")[0]
-                    return int(float(x_part))
-                return int(float(answer))
+            if result.get("status") == "ready":
+                solution = result.get("solution", {})
+                logger.info("2Captcha 返回结果: %s", solution)
+                # SliderCaptcha 返回 slideDistance 或 x 坐标
+                if "slideDistance" in solution:
+                    return int(float(solution["slideDistance"]))
+                if "x" in solution:
+                    return int(float(solution["x"]))
+                raise RuntimeError(f"2Captcha 未返回坐标: {solution}")
 
-            if result.get("request") != "CAPCHA_NOT_READY":
+            if result.get("status") != "processing":
                 raise RuntimeError(
-                    f"2Captcha 识别失败: {result.get('request')}"
+                    f"2Captcha 识别失败: {result.get('errorDescription', result.get('errorCode'))}"
                 )
 
         raise RuntimeError("2Captcha 识别超时")

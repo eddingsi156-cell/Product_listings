@@ -199,7 +199,7 @@ CAPTCHA_PROVIDER = ""                    # "ttshitu" 或 "twocaptcha"
 CAPTCHA_TTSHITU_USERNAME = ""            # 图鉴用户名
 CAPTCHA_TTSHITU_PASSWORD = ""            # 图鉴密码
 CAPTCHA_TWOCAPTCHA_KEY = ""              # 2Captcha API Key
-CAPTCHA_MAX_RETRIES = 3                  # 验证码识别最大重试次数
+CAPTCHA_MAX_RETRIES = 5                  # 验证码识别最大重试次数
 CAPTCHA_DETECT_TIMEOUT_MS = 5000         # 验证码检测等待超时(毫秒)
 
 # 日志配置

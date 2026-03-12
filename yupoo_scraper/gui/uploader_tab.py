@@ -56,6 +56,7 @@ class PreviewWorker(BaseWorker):
         price_mode: str,        # "fixed" | "random"
         price_min: float,
         price_max: float,
+        max_main_images: int = config.MAIN_IMAGE_MAX,
     ):
         super().__init__()
         self._folders = folders
@@ -64,6 +65,7 @@ class PreviewWorker(BaseWorker):
         self._price_mode = price_mode
         self._price_min = price_min
         self._price_max = price_max
+        self._max_main_images = max_main_images
 
     def _run(self) -> None:
         self.status.emit("正在加载 CLIP 模型...")
@@ -73,6 +75,7 @@ class PreviewWorker(BaseWorker):
             price=self._price,
             stock=self._stock,
             on_progress=lambda c, t: self.progress.emit(c, t),
+            max_main_images=self._max_main_images,
         )
 
         # 随机价格模式
@@ -306,6 +309,17 @@ class UploaderTab(QWidget):
         self._stock_spin.setFixedWidth(80)
         price_layout.addWidget(self._stock_spin)
 
+        price_layout.addSpacing(16)
+        price_layout.addWidget(QLabel("每文件夹图片数:"))
+        self._images_per_folder_spin = QSpinBox()
+        self._images_per_folder_spin.setRange(1, 50)
+        self._images_per_folder_spin.setValue(config.MAIN_IMAGE_MAX)
+        self._images_per_folder_spin.setFixedWidth(60)
+        self._images_per_folder_spin.setToolTip(
+            "每个产品文件夹上传的主图数量（微店最多15张）"
+        )
+        price_layout.addWidget(self._images_per_folder_spin)
+
         price_layout.addStretch()
 
         self._btn_preview = QPushButton("生成预览")
@@ -339,6 +353,7 @@ class UploaderTab(QWidget):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
 
+        self._product_table.itemChanged.connect(self._on_check_changed)
         main_layout.addWidget(self._product_table, 1)
 
         # 全选/取消全选
@@ -364,6 +379,10 @@ class UploaderTab(QWidget):
         sel_layout.addWidget(btn_sel_uploaded)
         btn_delete_sel = QPushButton("删除选中")
         btn_delete_sel.setFixedWidth(80)
+        btn_delete_sel.setStyleSheet(
+            "QPushButton { color: #C62828; font-weight: bold; }"
+            "QPushButton:hover { background-color: #FFCDD2; }"
+        )
         btn_delete_sel.clicked.connect(self._on_delete_selected)
         sel_layout.addWidget(btn_clear_marks)
         sel_layout.addWidget(btn_delete_sel)
@@ -375,6 +394,10 @@ class UploaderTab(QWidget):
         self._max_select_spin.setFixedWidth(80)
         self._max_select_spin.setToolTip("自动勾选的最大产品数量")
         sel_layout.addWidget(self._max_select_spin)
+        sel_layout.addSpacing(16)
+        self._sel_count_label = QLabel("已选: 0")
+        self._sel_count_label.setStyleSheet("font-size: 11px; color: #555;")
+        sel_layout.addWidget(self._sel_count_label)
         sel_layout.addStretch()
         main_layout.addLayout(sel_layout)
 
@@ -536,13 +559,14 @@ class UploaderTab(QWidget):
                     lo, hi = 0.0, 0.0
                 p_price = round(random.uniform(lo, hi), 2)
 
+            max_main = self._images_per_folder_spin.value()
             self._products.append(ProductInfo(
                 folder=folder,
                 title=folder.name,  # 临时标题 = 文件夹名
                 price=p_price,
                 stock=stock,
-                main_images=images[:config.MAIN_IMAGE_MAX],
-                detail_images=images[config.MAIN_IMAGE_MAX:][:config.DETAIL_IMAGE_MAX],
+                main_images=images[:max_main],
+                detail_images=images[max_main:][:config.DETAIL_IMAGE_MAX],
             ))
 
         self._populate_product_table()
@@ -552,6 +576,23 @@ class UploaderTab(QWidget):
 
         # 自动启动 CLIP 生成标题
         self._on_preview()
+
+    # ── 勾选计数 ─────────────────────────────────────────────────
+
+    @Slot()
+    def _on_check_changed(self, item) -> None:
+        """勾选框变化时更新计数标签。"""
+        if item.column() == 1:
+            self._update_sel_count()
+
+    def _update_sel_count(self) -> None:
+        count = sum(
+            1 for row in range(self._product_table.rowCount())
+            if (chk := self._product_table.item(row, 1))
+            and chk.checkState() == Qt.CheckState.Checked
+        )
+        total = self._product_table.rowCount()
+        self._sel_count_label.setText(f"已选: {count}/{total}")
 
     # ── 全选/取消全选 ───────────────────────────────────────────────
 
@@ -661,6 +702,7 @@ class UploaderTab(QWidget):
             price_mode=price_mode,
             price_min=price_min,
             price_max=price_max,
+            max_main_images=self._images_per_folder_spin.value(),
         )
         self._preview_worker.status.connect(self._on_preview_status)
         self._preview_worker.progress.connect(
@@ -752,6 +794,7 @@ class UploaderTab(QWidget):
                 self._product_table.setItem(row, 6, status_item)
         finally:
             self._product_table.setUpdatesEnabled(True)
+            self._update_sel_count()
 
     # ── 上架控制 ────────────────────────────────────────────────────
 
@@ -1037,11 +1080,39 @@ class UploaderTab(QWidget):
     @Slot()
     def _on_clear_marks(self) -> None:
         """清除上架标记：有勾选 → 只清勾选的；无勾选 → 清当前目录全部。"""
+        from PySide6.QtWidgets import QMessageBox
+
         selected_rows = [
             row for row in range(self._product_table.rowCount())
             if (chk := self._product_table.item(row, 1))
             and chk.checkState() == Qt.CheckState.Checked
         ]
+
+        if selected_rows:
+            count = sum(
+                1 for row in selected_rows
+                if row < len(self._products)
+                and self._is_uploaded(self._products[row].folder)
+            )
+            if count == 0:
+                self._progress.set_status("选中的产品均无上架标记")
+                return
+            msg = f"将清除 {count} 个选中产品的上架标记。\n清除后这些产品可能被重复上架，继续？"
+        else:
+            dir_key = str(self._download_dir)
+            count = len(self._upload_marks.get(dir_key, {}))
+            if count == 0:
+                self._progress.set_status("当前目录无上架标记")
+                return
+            msg = f"将清除当前目录下全部 {count} 个上架标记。\n清除后这些产品可能被重复上架，继续？"
+
+        reply = QMessageBox.warning(
+            self, "确认清除上架标记", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
         if selected_rows:
             for row in selected_rows:
@@ -1054,7 +1125,7 @@ class UploaderTab(QWidget):
 
         self._save_upload_marks()
         self._populate_product_table()
-        self._progress.set_status("已清除上架标记")
+        self._progress.set_status(f"已清除 {count} 个上架标记")
 
     @Slot()
     def _on_delete_selected(self) -> None:

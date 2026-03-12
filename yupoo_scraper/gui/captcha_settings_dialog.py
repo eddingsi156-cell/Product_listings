@@ -30,6 +30,76 @@ from .. import config
 
 logger = logging.getLogger(__name__)
 
+# ── 凭证加密（Windows DPAPI / fallback base64） ──────────────────
+
+# 需要加密存储的字段
+_SECRET_FIELDS = ("ttshitu_password", "twocaptcha_key")
+
+
+def _encrypt_secret(plain: str) -> str:
+    """加密敏感字符串。Windows 使用 DPAPI，其他平台 fallback base64。"""
+    if not plain:
+        return ""
+    raw = plain.encode("utf-8")
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                             ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+            blob_in = DATA_BLOB(len(raw), ctypes.create_string_buffer(raw, len(raw)))
+            blob_out = DATA_BLOB()
+            if ctypes.windll.crypt32.CryptProtectData(
+                ctypes.byref(blob_in), None, None, None, None, 0,
+                ctypes.byref(blob_out),
+            ):
+                enc = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                import base64
+                return "dpapi:" + base64.b64encode(enc).decode("ascii")
+        except Exception as e:
+            logger.debug("DPAPI 加密失败，fallback base64: %s", e)
+    # fallback: base64（至少不明文）
+    import base64
+    return "b64:" + base64.b64encode(raw).decode("ascii")
+
+
+def _decrypt_secret(stored: str) -> str:
+    """解密敏感字符串。"""
+    if not stored:
+        return ""
+    import base64
+    if stored.startswith("dpapi:"):
+        enc = base64.b64decode(stored[6:])
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                import ctypes.wintypes
+
+                class DATA_BLOB(ctypes.Structure):
+                    _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                                 ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+                blob_in = DATA_BLOB(len(enc), ctypes.create_string_buffer(enc, len(enc)))
+                blob_out = DATA_BLOB()
+                if ctypes.windll.crypt32.CryptUnprotectData(
+                    ctypes.byref(blob_in), None, None, None, None, 0,
+                    ctypes.byref(blob_out),
+                ):
+                    plain = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                    return plain.decode("utf-8")
+            except Exception as e:
+                logger.warning("DPAPI 解密失败: %s", e)
+        return ""  # 跨机器无法解密 DPAPI
+    if stored.startswith("b64:"):
+        return base64.b64decode(stored[4:]).decode("utf-8")
+    # 兼容旧版明文存储
+    return stored
+
 # 平台选项 (显示名, 内部标识)
 _PROVIDERS = [
     ("不使用", ""),
@@ -237,6 +307,11 @@ class CaptchaSettingsDialog(QDialog):
                 self._provider_combo.setCurrentIndex(i)
                 break
 
+        # 解密敏感字段
+        for field in _SECRET_FIELDS:
+            if data.get(field):
+                data[field] = _decrypt_secret(data[field])
+
         # 图鉴
         self._tt_user_input.setText(data.get("ttshitu_username", ""))
         self._tt_pass_input.setText(data.get("ttshitu_password", ""))
@@ -248,7 +323,7 @@ class CaptchaSettingsDialog(QDialog):
         self._retry_spin.setValue(data.get("max_retries", config.CAPTCHA_MAX_RETRIES))
         self._timeout_spin.setValue(data.get("detect_timeout_ms", config.CAPTCHA_DETECT_TIMEOUT_MS))
 
-        # 同步到 config
+        # 同步到 config（已解密的明文）
         self._apply_to_config(data)
 
         self._status_label.setText(f"已加载设置: {path.name}")
@@ -258,7 +333,8 @@ class CaptchaSettingsDialog(QDialog):
         idx = self._provider_combo.currentIndex()
         provider = _PROVIDERS[idx][1] if idx < len(_PROVIDERS) else ""
 
-        data = {
+        # 明文数据（用于 apply_to_config）
+        plain_data = {
             "provider": provider,
             "ttshitu_username": self._tt_user_input.text().strip(),
             "ttshitu_password": self._tt_pass_input.text().strip(),
@@ -267,17 +343,22 @@ class CaptchaSettingsDialog(QDialog):
             "detect_timeout_ms": self._timeout_spin.value(),
         }
 
+        # 磁盘存储数据（敏感字段加密）
+        disk_data = dict(plain_data)
+        for field in _SECRET_FIELDS:
+            if disk_data.get(field):
+                disk_data[field] = _encrypt_secret(disk_data[field])
+
         path = config.CAPTCHA_SETTINGS_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            json.dumps(disk_data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-        # 限制文件权限：仅当前用户可读写（保护凭证）
+        # 限制文件权限：仅当前用户可读写
         try:
             if sys.platform == "win32":
-                # Windows: 用 icacls 移除继承权限，仅保留当前用户完全控制
                 username = os.environ.get("USERNAME", "")
                 if username:
                     subprocess.run(
@@ -290,8 +371,8 @@ class CaptchaSettingsDialog(QDialog):
         except OSError:
             logger.warning("无法设置文件权限: %s", path)
 
-        self._apply_to_config(data)
-        return data
+        self._apply_to_config(plain_data)
+        return plain_data
 
     @staticmethod
     def _apply_to_config(data: dict) -> None:
@@ -300,7 +381,7 @@ class CaptchaSettingsDialog(QDialog):
         config.CAPTCHA_TTSHITU_USERNAME = data.get("ttshitu_username", "")
         config.CAPTCHA_TTSHITU_PASSWORD = data.get("ttshitu_password", "")
         config.CAPTCHA_TWOCAPTCHA_KEY = data.get("twocaptcha_key", "")
-        config.CAPTCHA_MAX_RETRIES = data.get("max_retries", 3)
+        config.CAPTCHA_MAX_RETRIES = data.get("max_retries", 5)
         config.CAPTCHA_DETECT_TIMEOUT_MS = data.get("detect_timeout_ms", 5000)
 
     # ── 测试连接 ─────────────────────────────────────────────────
@@ -430,6 +511,7 @@ class CaptchaSettingsDialog(QDialog):
     @Slot(bool, str)
     def _on_test_result(self, ok: bool, msg: str) -> None:
         self._btn_test.setEnabled(True)
+        self._test_thread = None  # 释放已结束的线程引用
         if ok:
             self._status_label.setText(f"  {msg}")
             self._status_label.setStyleSheet(
@@ -483,6 +565,10 @@ def load_captcha_settings_on_startup() -> None:
         return
     try:
         data = json.loads(path.read_text("utf-8"))
+        # 解密敏感字段
+        for field in _SECRET_FIELDS:
+            if data.get(field):
+                data[field] = _decrypt_secret(data[field])
         CaptchaSettingsDialog._apply_to_config(data)
         logger.info("已加载验证码设置: provider=%s", data.get("provider", ""))
     except (json.JSONDecodeError, OSError) as e:
